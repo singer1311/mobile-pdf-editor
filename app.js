@@ -777,6 +777,48 @@ function setupFabricEventListeners() {
   });
 }
 
+// Detect if the text is inside a colored container (e.g. a dark blue header card) and find its right boundary
+function findContainerRightBoundary(left, top, width, maskColor) {
+  try {
+    const pdfCanvas = elements.pdfCanvas;
+    if (!pdfCanvas || !maskColor) return 0;
+    const ctx = pdfCanvas.getContext('2d', { willReadFrequently: true });
+
+    let targetR, targetG, targetB;
+    if (maskColor.startsWith('#') && (maskColor.length === 7 || maskColor.length === 4)) {
+      const hex = maskColor.replace('#', '');
+      const step = hex.length === 3 ? 1 : 2;
+      targetR = parseInt(hex.substring(0, step), 16) * (hex.length === 3 ? 17 : 1);
+      targetG = parseInt(hex.substring(step, step * 2), 16) * (hex.length === 3 ? 17 : 1);
+      targetB = parseInt(hex.substring(step * 2, step * 3), 16) * (hex.length === 3 ? 17 : 1);
+    } else {
+      return 0;
+    }
+
+    // Start scanning from the right edge of the text line
+    const startX = Math.round(left + width);
+    const y = Math.round(top + 4);
+    if (startX < 0 || startX >= pdfCanvas.width || y < 0 || y >= pdfCanvas.height) return 0;
+
+    const scanLen = Math.min(300, pdfCanvas.width - startX);
+    const rowData = ctx.getImageData(startX, y, scanLen, 1).data;
+
+    for (let i = 0; i < scanLen; i++) {
+      const r = rowData[i * 4];
+      const g = rowData[i * 4 + 1];
+      const b = rowData[i * 4 + 2];
+      const diff = Math.abs(r - targetR) + Math.abs(g - targetG) + Math.abs(b - targetB);
+      if (diff > 50) {
+        // Container boundary reached at startX + i; total allowed width from left is width + i
+        return Math.max(width, width + i);
+      }
+    }
+    return 0;
+  } catch (e) {
+    return 0;
+  }
+}
+
 // Automatically expand textbox width and linked background mask as the user types
 function updateTextDimensionsAndMask(obj) {
   if (!obj || !obj.data?.isText) return;
@@ -798,36 +840,35 @@ function updateTextDimensionsAndMask(obj) {
     maxLineWidth = (obj.getLineWidth ? obj.getLineWidth(0) : obj.width) || 50;
   }
 
-  // 2. Expand width to fit all typed characters horizontally without being constrained
-  const baseWidth = obj.data.initialWidth || 60;
-  const desiredWidth = Math.max(baseWidth, Math.ceil(maxLineWidth + 28));
-
+  // 2. Expand textbox width for cursor room, transparent so zero visual side-effects
+  const baseWidth = obj.data.initialWidth || 50;
+  const desiredWidth = Math.max(baseWidth, Math.ceil(maxLineWidth + 12));
   if (desiredWidth > obj.width) {
     obj.set('width', desiredWidth);
     if (obj.initDimensions) obj.initDimensions();
   }
 
-  // 3. Expand linked background mask to cleanly cover newly typed text
+  // 3. Mask width: Tightly fitted to text, NEVER oversized, NEVER sticking out of containers!
   if (obj.data?.linkedMaskId && fabricCanvas) {
     const mask = fabricCanvas.getObjects().find(o => o.data?.id === obj.data.linkedMaskId);
     if (mask) {
-      // Self-heal: If mask was inadvertently colored (e.g. blue) on light document paper, snap it to pure white!
-      if (mask.fill && mask.fill.toLowerCase() !== '#ffffff') {
-        const colors = samplePdfColors(obj.left, obj.top, obj.width, obj.height);
-        if (colors.bgColor === '#ffffff') {
-          mask.set('fill', '#ffffff');
-          if (obj.fill === '#ffffff') {
-            obj.set('fill', '#111827');
-          }
-        }
+      const origMaskWidth = obj.data.initialMaskWidth || mask.data?.initialMaskWidth || mask.width;
+      
+      // Only expand mask if the user typed text that is actually wider than the original line!
+      let targetMaskWidth = origMaskWidth;
+      if (maxLineWidth > origMaskWidth - 2) {
+        targetMaskWidth = Math.ceil(maxLineWidth + 2);
       }
 
-      const origMaskWidth = obj.data.initialMaskWidth || mask.width;
-      const currentWidth = obj.getScaledWidth ? obj.getScaledWidth() : obj.width;
-      const currentHeight = obj.getScaledHeight ? obj.getScaledHeight() : obj.height;
+      // Clamp to container right boundary if inside a colored card/block
+      const maxAllowed = findContainerRightBoundary(mask.left, mask.top, origMaskWidth, mask.fill);
+      if (maxAllowed > 0 && targetMaskWidth > maxAllowed) {
+        targetMaskWidth = maxAllowed;
+      }
+
       mask.set({
-        width: Math.max(origMaskWidth, currentWidth + 6),
-        height: Math.max(mask.height, currentHeight + 2),
+        width: targetMaskWidth,
+        height: Math.max(mask.height, (obj.getScaledHeight ? obj.getScaledHeight() : obj.height) + 1),
       });
     }
   }
@@ -921,22 +962,30 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
   const maskId = 'mask_' + Math.random().toString(36).substr(2, 9);
   const textId = 'text_' + Math.random().toString(36).substr(2, 9);
 
-  // 2. Solid background mask perfectly covers original PDF text (tight vertical bounds)
+  // 2. Solid background mask perfectly covers original PDF text (tight bounds)
   const maskRect = new fabric.Rect({
-    left: Math.max(0, line.left - 2),
+    left: line.left,
     top: Math.max(0, line.top - 1),
-    width: line.width + 4,
+    width: line.width,
     height: Math.max(line.height + 2, line.canvasFontSize * 1.15),
     fill: colors.bgColor,
     selectable: false,
     evented: false,
     strokeWidth: 0,
-    data: { isMask: true, id: maskId, lineId: line.id, linkedTextId: textId },
+    data: { 
+      isMask: true, 
+      id: maskId, 
+      lineId: line.id, 
+      linkedTextId: textId,
+      initialMaskWidth: line.width,
+      initialLeft: line.left,
+      bgColor: colors.bgColor,
+    },
   });
   fabricCanvas.add(maskRect);
 
-  const initialWidth = Math.max(line.width + 30, 60);
-  const initialMaskWidth = line.width + 4;
+  const initialWidth = Math.max(line.width + 12, 40);
+  const initialMaskWidth = line.width;
 
   // 3. In-place editable Textbox preserving original font size, color, weight, and font family
   const textbox = new fabric.Textbox(line.text, {
@@ -1207,11 +1256,9 @@ function samplePdfColors(left, top, width, height) {
     if (w <= 0 || h <= 0) return { bgColor: '#ffffff', textColor: '#111827' };
 
     // 1. Interior mode sampling: characters take ~15-25% of area; background is the dominant mode (众数)
-    // Never jump outside the box to prevent grabbing blue borders, table lines, or colored frames!
+    // Sample strictly INSIDE the text box to avoid grabbing outside borders or lines
     const imgData = ctx.getImageData(l, t, w, h).data;
     const colorHistogram = new Map();
-    let totalSamples = 0;
-    let whitePixelCount = 0;
 
     const stride = 12; // 3 pixels * 4 bytes for fast, representative sampling
     for (let i = 0; i < imgData.length; i += stride) {
@@ -1221,42 +1268,35 @@ function samplePdfColors(left, top, width, height) {
       const a = imgData[i + 3];
       if (a < 80) continue;
 
-      totalSamples++;
-      if (r > 215 && g > 215 && b > 215) {
-        whitePixelCount++;
-      }
-
-      // 16-level buckets to group anti-aliased variations
-      const qr = Math.round(r / 16) * 16;
-      const qg = Math.round(g / 16) * 16;
-      const qb = Math.round(b / 16) * 16;
+      // 8-level buckets to preserve subtle pastel tints (e.g. light blue #e8f3fb from white)
+      const qr = Math.round(r / 8) * 8;
+      const qg = Math.round(g / 8) * 8;
+      const qb = Math.round(b / 8) * 8;
       const key = `${qr},${qg},${qb}`;
 
       colorHistogram.set(key, (colorHistogram.get(key) || 0) + 1);
     }
 
-    // If 30%+ of interior pixels are white/near-white, the background is undeniably white paper
-    let bg = { r: 255, g: 255, b: 255 };
-    if (totalSamples > 0 && (whitePixelCount / totalSamples) >= 0.30) {
-      bg = { r: 255, g: 255, b: 255 };
-    } else if (colorHistogram.size > 0) {
-      // Find mode bucket
-      let maxCount = 0;
-      let dominantKey = '255,255,255';
-      for (const [key, count] of colorHistogram.entries()) {
-        if (count > maxCount) {
-          maxCount = count;
-          dominantKey = key;
-        }
+    // Find dominant color bucket (mode)
+    let maxCount = 0;
+    let dominantKey = '255,255,255';
+    for (const [key, count] of colorHistogram.entries()) {
+      if (count > maxCount) {
+        maxCount = count;
+        dominantKey = key;
       }
-      const [dr, dg, db] = dominantKey.split(',').map(Number);
-      bg = { r: dr, g: dg, b: db };
+    }
+    const [dr, dg, db] = dominantKey.split(',').map(Number);
+    let bg = { r: dr, g: dg, b: db };
 
-      // Snap near-white document paper to pure white
-      const bgLum = (bg.r * 299 + bg.g * 587 + bg.b * 114) / 1000;
-      if (bgLum > 195 || (bg.r > 210 && bg.g > 210 && bg.b > 210)) {
-        bg = { r: 255, g: 255, b: 255 };
-      }
+    // Snap to pure neutral white ONLY if all channels are >= 248 and almost equal (neutral paper scan noise)
+    // NEVER snap tinted backgrounds (like light blue #e8f3fb, light gray, pastel) to white!
+    const isPureNeutralWhite = (bg.r >= 248 && bg.g >= 248 && bg.b >= 248 &&
+                                Math.abs(bg.r - bg.g) <= 4 &&
+                                Math.abs(bg.r - bg.b) <= 4 &&
+                                Math.abs(bg.g - bg.b) <= 4);
+    if (isPureNeutralWhite) {
+      bg = { r: 255, g: 255, b: 255 };
     }
 
     // 2. Interior contrast sampling for text ink color
@@ -2451,18 +2491,19 @@ async function executeBatchReplace() {
             const textId = 'text_' + Math.random().toString(36).substr(2, 9);
             const isBoldFinal = Boolean(line.isBold);
 
+            const lineColors = samplePdfColors(line.left, line.top, line.width, line.height);
             const maskObj = {
               type: 'rect',
               version: '5.3.0',
-              left: Math.max(0, line.left - 2),
+              left: line.left,
               top: Math.max(0, line.top - 1),
-              width: line.width + 4,
+              width: line.width,
               height: Math.max(line.height + 2, line.canvasFontSize * 1.15),
-              fill: '#ffffff',
+              fill: lineColors.bgColor,
               selectable: false,
               evented: false,
               strokeWidth: 0,
-              data: { isMask: true, id: maskId, lineId: line.id, linkedTextId: textId },
+              data: { isMask: true, id: maskId, lineId: line.id, linkedTextId: textId, initialMaskWidth: line.width },
             };
 
             const textObj = {
@@ -2470,10 +2511,10 @@ async function executeBatchReplace() {
               version: '5.3.0',
               left: line.left,
               top: line.top,
-              width: Math.max(line.width + 30, 60),
+              width: Math.max(line.width + 12, 40),
               text: nextText,
               fontSize: line.canvasFontSize,
-              fill: '#111827',
+              fill: lineColors.textColor,
               backgroundColor: 'transparent',
               fontFamily: line.fontFamily || 'system-ui, -apple-system, sans-serif',
               fontWeight: isBoldFinal ? 'bold' : 'normal',
@@ -2486,6 +2527,8 @@ async function executeBatchReplace() {
                 linkedMaskId: maskId,
                 originalText: line.text,
                 isBoldOriginal: isBoldFinal,
+                initialWidth: Math.max(line.width + 12, 40),
+                initialMaskWidth: line.width,
               },
             };
 
