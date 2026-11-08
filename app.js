@@ -22,10 +22,11 @@ const state = {
   currentZoom: 1.0,
   baseScale: 1.5, // 1.5x base scale for retina crisp rendering
   mode: 'edit',   // 'edit' | 'browse'
-  tool: 'cover-edit', // 'browse' | 'cover-edit' | 'add-text' | 'signature' | 'brush' | 'mask' | 'select'
+  tool: 'tap-edit', // 'tap-edit' | 'cover-edit' | 'browse' | 'add-text' | 'signature' | 'brush' | 'mask' | 'select'
 
-  // Per-page Fabric objects serialized storage
+  // Per-page Fabric objects serialized storage & extracted text
   pageStates: {},
+  pageTextLines: {},
   historyStack: {},
 
   // Drawing & Tools state
@@ -71,6 +72,9 @@ const elements = {
   btnPrevPage: document.getElementById('btn-prev-page'),
   btnNextPage: document.getElementById('btn-next-page'),
   btnOpenPdf: document.getElementById('btn-open-pdf'),
+  btnConvertAllText: document.getElementById('btn-convert-all-text'),
+  smartEditTipBanner: document.getElementById('smart-edit-tip-banner'),
+  btnCloseTipBanner: document.getElementById('btn-close-tip-banner'),
   pdfFileInput: document.getElementById('pdf-file-input'),
   btnExportPdf: document.getElementById('btn-export-pdf'),
   modeSwitchGroup: document.getElementById('mode-switch-group'),
@@ -87,8 +91,10 @@ const elements = {
   zoomPercentageLabel: document.getElementById('zoom-percentage-label'),
 
   // Toolbar buttons
-  toolBrowse: document.getElementById('tool-browse'),
+  toolTapEdit: document.getElementById('tool-tap-edit'),
   toolCoverEdit: document.getElementById('tool-cover-edit'),
+  toolConvertPage: document.getElementById('tool-convert-page'),
+  toolBrowse: document.getElementById('tool-browse'),
   toolAddText: document.getElementById('tool-add-text'),
   toolSignature: document.getElementById('tool-signature'),
   toolBrush: document.getElementById('tool-brush'),
@@ -215,6 +221,14 @@ async function openPdfFile(arrayBuffer, fileName = 'document.pdf', password = ''
     elements.modeSwitchGroup.classList.add('flex');
     elements.floatingZoomHud.classList.remove('hidden');
     elements.floatingZoomHud.classList.add('flex');
+    if (elements.btnConvertAllText) {
+      elements.btnConvertAllText.classList.remove('hidden');
+      elements.btnConvertAllText.classList.add('flex');
+    }
+    if (elements.smartEditTipBanner) {
+      elements.smartEditTipBanner.classList.remove('hidden');
+      elements.smartEditTipBanner.classList.add('flex');
+    }
 
     updatePaginationUI();
     await renderPage(1);
@@ -330,6 +344,13 @@ async function renderPage(pageNum) {
           resolve();
         });
       });
+    }
+
+    // 5.1 Pre-extract and cache text lines for smart Word-like click editing
+    try {
+      state.pageTextLines[pageNum] = await extractPageTextLines(page, viewport);
+    } catch (e) {
+      console.warn('Text extraction warning:', e);
     }
 
     // 6. Apply zoom scaling
@@ -464,6 +485,19 @@ function applyCurrentMode() {
     fabricCanvas.defaultCursor = 'grab';
     fabricCanvas.hoverCursor = 'grab';
     fabricCanvas.forEachObject(obj => obj.selectable = false);
+  } else if (state.tool === 'tap-edit') {
+    fabricCanvas.selection = true;
+    fabricCanvas.defaultCursor = 'text';
+    fabricCanvas.hoverCursor = 'text';
+    fabricCanvas.forEachObject(obj => {
+      if (obj.data?.isMask) {
+        obj.selectable = false;
+        obj.evented = false;
+      } else {
+        obj.selectable = true;
+        obj.evented = true;
+      }
+    });
   } else if (state.tool === 'cover-edit' || state.tool === 'mask') {
     fabricCanvas.selection = false;
     fabricCanvas.discardActiveObject();
@@ -482,14 +516,57 @@ function applyCurrentMode() {
 }
 
 // ==========================================
-// 6. "Cover & Edit" (遮盖改字) Core Mechanism
+// 6. Word-Like Direct Tap-To-Edit & Convert
 // ==========================================
 function setupFabricEventListeners() {
   // Mouse down / Touch start
   fabricCanvas.on('mouse:down', (opt) => {
+    const pointer = opt.pointer || (opt.e ? fabricCanvas.getPointer(opt.e) : { x: 0, y: 0 });
+
+    // 1. Smart Word-like "Tap to Edit"
+    if (state.tool === 'tap-edit') {
+      const clickedTarget = opt.target;
+      // If clicked on an existing textbox
+      if (clickedTarget && (clickedTarget.type === 'textbox' || clickedTarget.type === 'i-text')) {
+        fabricCanvas.setActiveObject(clickedTarget);
+        clickedTarget.enterEditing();
+        return;
+      }
+
+      // Check if clicked directly on underlying original PDF text
+      const lines = state.pageTextLines[state.currentPage] || [];
+      const padding = 8;
+      const hitLine = lines.find(l => 
+        pointer.x >= l.left - padding &&
+        pointer.x <= l.left + l.width + padding &&
+        pointer.y >= l.top - padding &&
+        pointer.y <= l.top + l.height + padding
+      );
+
+      if (hitLine) {
+        // Check if an existing textbox already covers this line
+        const existing = fabricCanvas.getObjects().find(o => 
+          o.data?.isText &&
+          Math.abs(o.left - hitLine.left) < 15 &&
+          Math.abs(o.top - hitLine.top) < 15
+        );
+
+        if (existing) {
+          fabricCanvas.setActiveObject(existing);
+          existing.enterEditing();
+          fabricCanvas.requestRenderAll();
+          return;
+        }
+
+        // Convert this specific text line to an in-place Word textbox immediately!
+        convertLineToTextbox(hitLine, true);
+        return;
+      }
+    }
+
+    // 2. Cover & Edit / Pure Mask Rubberband Dragging
     if (state.tool === 'cover-edit' || state.tool === 'mask') {
       state.isDrawingBox = true;
-      const pointer = opt.pointer || (opt.e ? fabricCanvas.getPointer(opt.e) : { x: 0, y: 0 });
       state.boxStartX = pointer.x;
       state.boxStartY = pointer.y;
 
@@ -539,22 +616,23 @@ function setupFabricEventListeners() {
     // Minimum drag threshold to prevent accidental clicks
     if (width < 6 || height < 6) return;
 
-    // 1. Auto extract background color around the bounding box from pdf-canvas
-    const sampledBgColor = samplePdfBackgroundColor(left, top, width, height);
+    // 1. Smart dual-sample background and text color from PDF
+    const colors = samplePdfColors(left, top, width, height);
 
     // 2. Create the solid mask rectangle
+    const maskId = 'mask_' + Date.now();
     const maskRect = new fabric.Rect({
       left: left,
       top: top,
       width: width,
       height: height,
-      fill: sampledBgColor,
-      selectable: true,
+      fill: colors.bgColor,
+      selectable: (state.tool === 'mask'),
       hasBorders: true,
       borderColor: '#94a3b8',
       cornerSize: 12,
       strokeWidth: 0,
-      data: { isMask: true, id: 'mask_' + Date.now() },
+      data: { isMask: true, id: maskId },
     });
     fabricCanvas.add(maskRect);
 
@@ -568,11 +646,11 @@ function setupFabricEventListeners() {
         top: top + Math.max(0, (height - calculatedFontSize * 1.25) / 2),
         width: Math.max(width, 100),
         fontSize: calculatedFontSize,
-        fill: state.textColor,
+        fill: colors.textColor,
         fontFamily: 'system-ui, -apple-system, sans-serif',
         fontWeight: state.isBold ? 'bold' : 'normal',
         editable: true,
-        data: { isText: true, linkedMaskId: maskRect.data.id },
+        data: { isText: true, linkedMaskId: maskId },
       });
 
       fabricCanvas.add(textbox);
@@ -581,14 +659,21 @@ function setupFabricEventListeners() {
       textbox.selectAll();
 
       showToast('已覆盖原文字，可直接打字替换！', 'info');
+      setTool('tap-edit');
     } else {
       fabricCanvas.setActiveObject(maskRect);
       showToast('已生成遮罩块覆盖原内容！', 'info');
+      setTool('select');
     }
 
-    // Switch to select tool so user can tweak or tap freely
-    setTool('select');
     fabricCanvas.requestRenderAll();
+  });
+
+  // Double click / Tap to edit support for textboxes
+  fabricCanvas.on('mouse:dblclick', (opt) => {
+    if (opt.target && (opt.target.type === 'textbox' || opt.target.type === 'i-text')) {
+      opt.target.enterEditing();
+    }
   });
 
   // Selection events
@@ -602,42 +687,282 @@ function setupFabricEventListeners() {
   });
 }
 
-// Sample background color from underlying rendered PDF page
-function samplePdfBackgroundColor(left, top, width, height) {
+// Convert a single extracted text line to a Word-like interactive in-place Textbox
+function convertLineToTextbox(line, shouldEditImmediately = true) {
+  // 1. Sample surrounding background color and text contrast color
+  const colors = samplePdfColors(line.left, line.top, line.width, line.height);
+
+  const maskId = 'mask_' + Math.random().toString(36).substr(2, 9);
+  const textId = 'text_' + Math.random().toString(36).substr(2, 9);
+
+  // 2. Solid background mask perfectly covers original PDF text
+  const maskRect = new fabric.Rect({
+    left: Math.max(0, line.left - 2),
+    top: Math.max(0, line.top - 2),
+    width: line.width + 4,
+    height: Math.max(line.height + 4, line.canvasFontSize * 1.25),
+    fill: colors.bgColor,
+    selectable: false,
+    evented: false,
+    strokeWidth: 0,
+    data: { isMask: true, id: maskId, linkedTextId: textId },
+  });
+  fabricCanvas.add(maskRect);
+
+  // 3. In-place editable Textbox preserving original font size, color, weight
+  const textbox = new fabric.Textbox(line.text, {
+    left: line.left,
+    top: line.top,
+    width: Math.max(line.width + 8, 50),
+    fontSize: line.canvasFontSize,
+    fill: colors.textColor,
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    fontWeight: line.isBold ? 'bold' : 'normal',
+    editable: true,
+    hasBorders: true,
+    borderColor: '#3b82f6',
+    borderDashArray: [3, 3],
+    borderScaleFactor: 1.2,
+    padding: 2,
+    transparentCorners: false,
+    cornerColor: '#2563eb',
+    cornerSize: 10,
+    touchCornerSize: 26,
+    data: {
+      isText: true,
+      id: textId,
+      linkedMaskId: maskId,
+      originalText: line.text,
+    },
+  });
+
+  fabricCanvas.add(textbox);
+
+  if (shouldEditImmediately) {
+    fabricCanvas.setActiveObject(textbox);
+    textbox.enterEditing();
+    textbox.selectAll();
+    showToast('已进入 Word 修改模式，直接打字替换！', 'info');
+  }
+
+  saveCurrentPageState(state.currentPage);
+  fabricCanvas.requestRenderAll();
+  return textbox;
+}
+
+// One-Click Word Mode: Convert all text lines on the current page to editable textboxes
+async function convertAllTextToEditable() {
+  if (!state.pdfDoc || !fabricCanvas) {
+    showToast('请先打开 PDF 文件', 'error');
+    return;
+  }
+
+  showToast('正在识别当前页文字，生成 Word 文本框...', 'info');
+
+  let lines = state.pageTextLines[state.currentPage];
+  if (!lines || lines.length === 0) {
+    const page = await state.pdfDoc.getPage(state.currentPage);
+    const viewport = page.getViewport({ scale: state.baseScale });
+    lines = await extractPageTextLines(page, viewport);
+    state.pageTextLines[state.currentPage] = lines;
+  }
+
+  if (!lines || lines.length === 0) {
+    showToast('当前页未检测到可选文字（可能是纯扫描图片）', 'warning');
+    return;
+  }
+
+  let count = 0;
+  for (const line of lines) {
+    // Avoid creating duplicates if a textbox already covers this position
+    const alreadyExists = fabricCanvas.getObjects().some(o => 
+      o.data?.isText &&
+      Math.abs(o.left - line.left) < 15 &&
+      Math.abs(o.top - line.top) < 15
+    );
+
+    if (!alreadyExists) {
+      convertLineToTextbox(line, false);
+      count++;
+    }
+  }
+
+  saveCurrentPageState(state.currentPage);
+  setTool('tap-edit');
+  fabricCanvas.requestRenderAll();
+
+  if (count > 0) {
+    showToast(`🎉 已将本页 ${count} 处文字全部转为 Word 文本框，直接点击文字即可修改！`, 'success');
+    if (window.confetti) {
+      window.confetti({ particleCount: 70, spread: 70, origin: { y: 0.8 } });
+    }
+  } else {
+    showToast('本页文字已全部转为文本框，点击任意文字即可修改！', 'info');
+  }
+}
+
+// Extract and cluster text items from PDF.js into coherent text lines
+async function extractPageTextLines(page, viewport) {
+  try {
+    const textContent = await page.getTextContent();
+    const rawItems = textContent.items.filter(it => it.str && it.str.trim().length > 0);
+    if (rawItems.length === 0) return [];
+
+    const items = rawItems.map(it => {
+      const [vx, vy] = viewport.convertToViewportPoint(it.transform[4], it.transform[5]);
+      const pdfFontSize = Math.hypot(it.transform[0], it.transform[1]) || 12;
+      const canvasFontSize = Math.round(pdfFontSize * state.baseScale);
+      const width = it.width * state.baseScale;
+      const height = (it.height || pdfFontSize) * state.baseScale;
+      const top = vy - canvasFontSize * 0.95;
+
+      const fn = (it.fontName || '').toLowerCase();
+      const isBold = fn.includes('bold') || fn.includes('black') || fn.includes('heavy') || fn.includes('f1');
+
+      return {
+        str: it.str,
+        fontName: it.fontName || '',
+        isBold,
+        canvasFontSize,
+        pdfFontSize,
+        vx, vy,
+        left: vx,
+        top,
+        width,
+        height: Math.max(height, canvasFontSize * 1.15),
+      };
+    });
+
+    // Sort items: top to bottom, then left to right
+    items.sort((a, b) => {
+      if (Math.abs(a.vy - b.vy) > 6) {
+        return a.vy - b.vy;
+      }
+      return a.left - b.left;
+    });
+
+    const lines = [];
+    let currentLine = null;
+
+    for (const item of items) {
+      if (!currentLine) {
+        currentLine = { ...item, text: item.str, items: [item] };
+        continue;
+      }
+
+      const sameBaseline = Math.abs(currentLine.vy - item.vy) <= Math.max(5, item.canvasFontSize * 0.35);
+      const xGap = item.left - (currentLine.left + currentLine.width);
+
+      if (sameBaseline && xGap < item.canvasFontSize * 1.8 && xGap > -15) {
+        const addSpace = (xGap > 2 && !currentLine.text.endsWith(' ') && !item.str.startsWith(' ')) ? ' ' : '';
+        currentLine.text += addSpace + item.str;
+        currentLine.width = (item.left + item.width) - currentLine.left;
+        currentLine.height = Math.max(currentLine.height, item.height);
+        currentLine.canvasFontSize = Math.max(currentLine.canvasFontSize, item.canvasFontSize);
+        currentLine.isBold = currentLine.isBold || item.isBold;
+        currentLine.items.push(item);
+      } else {
+        lines.push(currentLine);
+        currentLine = { ...item, text: item.str, items: [item] };
+      }
+    }
+    if (currentLine) lines.push(currentLine);
+    return lines;
+  } catch (err) {
+    console.warn('Failed to extract page text lines:', err);
+    return [];
+  }
+}
+
+// Smart dual-sampling: samples both perimeter background color and text contrast color
+function samplePdfColors(left, top, width, height) {
   try {
     const pdfCanvas = elements.pdfCanvas;
+    if (!pdfCanvas) return { bgColor: '#ffffff', textColor: '#111827' };
     const ctx = pdfCanvas.getContext('2d', { willReadFrequently: true });
-    
-    // Sample 5 points around the bounding box border (slightly outside)
-    const points = [
-      { x: Math.max(0, left - 2), y: Math.max(0, top - 2) },
-      { x: Math.min(pdfCanvas.width - 1, left + width + 2), y: Math.max(0, top - 2) },
-      { x: Math.max(0, left - 2), y: Math.min(pdfCanvas.height - 1, top + height + 2) },
-      { x: left + width / 2, y: Math.max(0, top - 2) },
-      { x: Math.max(0, left - 2), y: top + height / 2 },
+
+    const l = Math.max(0, Math.floor(left));
+    const t = Math.max(0, Math.floor(top));
+    const w = Math.min(pdfCanvas.width - l, Math.ceil(width));
+    const h = Math.min(pdfCanvas.height - t, Math.ceil(height));
+
+    if (w <= 0 || h <= 0) return { bgColor: '#ffffff', textColor: '#111827' };
+
+    // 1. Perimeter sampling for true background color (points slightly outside bounding box)
+    const perimeterPoints = [
+      { x: l - 3, y: t - 3 },
+      { x: l + Math.floor(w / 2), y: t - 3 },
+      { x: l + w + 3, y: t - 3 },
+      { x: l - 3, y: t + Math.floor(h / 2) },
+      { x: l + w + 3, y: t + Math.floor(h / 2) },
+      { x: l - 3, y: t + h + 3 },
+      { x: l + Math.floor(w / 2), y: t + h + 3 },
+      { x: l + w + 3, y: t + h + 3 },
     ];
 
-    let rSum = 0, gSum = 0, bSum = 0, count = 0;
-    for (const p of points) {
-      const pixel = ctx.getImageData(Math.floor(p.x), Math.floor(p.y), 1, 1).data;
-      if (pixel[3] > 80) { // Opaque enough
-        rSum += pixel[0];
-        gSum += pixel[1];
-        bSum += pixel[2];
-        count++;
+    let bgR = 0, bgG = 0, bgB = 0, bgCount = 0;
+    for (const p of perimeterPoints) {
+      const px = Math.min(pdfCanvas.width - 1, Math.max(0, p.x));
+      const py = Math.min(pdfCanvas.height - 1, Math.max(0, p.y));
+      const pixel = ctx.getImageData(px, py, 1, 1).data;
+      if (pixel[3] > 80) {
+        bgR += pixel[0];
+        bgG += pixel[1];
+        bgB += pixel[2];
+        bgCount++;
       }
     }
 
-    if (count > 0) {
-      const r = Math.round(rSum / count);
-      const g = Math.round(gSum / count);
-      const b = Math.round(bSum / count);
-      return `#${((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1)}`;
+    let bg = { r: 255, g: 255, b: 255 };
+    if (bgCount > 0) {
+      bg = {
+        r: Math.round(bgR / bgCount),
+        g: Math.round(bgG / bgCount),
+        b: Math.round(bgB / bgCount),
+      };
     }
+
+    // 2. Interior contrast sampling for text color
+    const imgData = ctx.getImageData(l, t, w, h).data;
+    let textR = 0, textG = 0, textB = 0, textCount = 0;
+
+    for (let i = 0; i < imgData.length; i += 16) { // step by 4 pixels (16 bytes)
+      const r = imgData[i], g = imgData[i + 1], b = imgData[i + 2], a = imgData[i + 3];
+      if (a < 100) continue;
+      const dist = Math.abs(r - bg.r) + Math.abs(g - bg.g) + Math.abs(b - bg.b);
+      if (dist > 38) { // Distinct contrast from background
+        textR += r;
+        textG += g;
+        textB += b;
+        textCount++;
+      }
+    }
+
+    let text = { r: 17, g: 24, b: 39 };
+    if (textCount > 0) {
+      text = {
+        r: Math.round(textR / textCount),
+        g: Math.round(textG / textCount),
+        b: Math.round(textB / textCount),
+      };
+    } else {
+      const bgBrightness = (bg.r * 299 + bg.g * 587 + bg.b * 114) / 1000;
+      text = bgBrightness > 128 ? { r: 17, g: 24, b: 39 } : { r: 255, g: 255, b: 255 };
+    }
+
+    const toHex = (c) => `#${((1 << 24) + (c.r << 16) + (c.g << 8) + c.b).toString(16).slice(1)}`;
+    return {
+      bgColor: toHex(bg),
+      textColor: toHex(text),
+    };
   } catch (err) {
-    console.warn('Could not sample background color:', err);
+    console.warn('samplePdfColors error:', err);
+    return { bgColor: '#ffffff', textColor: '#111827' };
   }
-  return '#ffffff'; // Default to white
+}
+
+function samplePdfBackgroundColor(left, top, width, height) {
+  return samplePdfColors(left, top, width, height).bgColor;
 }
 
 // ==========================================
@@ -1162,6 +1487,22 @@ function setupEventListeners() {
   elements.btnZoomReset.addEventListener('click', () => setZoom(1.0));
   elements.btnZoomFit.addEventListener('click', () => fitToScreenWidth());
   elements.btnZoom200.addEventListener('click', () => setZoom(2.0));
+
+  // Word Mode & Direct Edit Buttons
+  if (elements.btnConvertAllText) {
+    elements.btnConvertAllText.addEventListener('click', convertAllTextToEditable);
+  }
+  if (elements.toolConvertPage) {
+    elements.toolConvertPage.addEventListener('click', convertAllTextToEditable);
+  }
+  if (elements.toolTapEdit) {
+    elements.toolTapEdit.addEventListener('click', () => setTool('tap-edit'));
+  }
+  if (elements.btnCloseTipBanner) {
+    elements.btnCloseTipBanner.addEventListener('click', () => {
+      elements.smartEditTipBanner.classList.add('hidden');
+    });
+  }
 
   // Bottom Toolbar Tools
   elements.toolBrowse.addEventListener('click', () => setTool('browse'));
