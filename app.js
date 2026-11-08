@@ -52,6 +52,9 @@ const state = {
   initialPinchZoom: 1.0,
 };
 
+// Expose state for inspection & debugging
+window.state = state;
+
 // Fabric Canvas instance
 let fabricCanvas = null;
 
@@ -329,6 +332,7 @@ async function renderPage(pageNum) {
         fireRightClick: true,
       });
       setupFabricEventListeners();
+      window.fabricCanvas = fabricCanvas;
     } else {
       fabricCanvas.clear();
     }
@@ -547,8 +551,11 @@ function setupFabricEventListeners() {
       const hitBox = findClosestObject(textboxes, pointer);
       if (hitBox) {
         fabricCanvas.setActiveObject(hitBox);
-        hitBox.enterEditing();
-        fabricCanvas.requestRenderAll();
+        setTimeout(() => {
+          hitBox.enterEditing();
+          hitBox.hiddenTextarea?.focus();
+          fabricCanvas.requestRenderAll();
+        }, 30);
         return;
       }
 
@@ -557,17 +564,20 @@ function setupFabricEventListeners() {
       const hitLine = findClosestTextLine(lines, pointer);
 
       if (hitLine) {
-        // Check if an existing textbox already covers this line
+        // Check if an existing textbox already covers this line (by line ID or exact coordinate match)
         const existing = fabricCanvas.getObjects().find(o => 
           o.data?.isText &&
-          Math.abs(o.left - hitLine.left) < 15 &&
-          Math.abs(o.top - hitLine.top) < 15
+          (o.data?.lineId === hitLine.id ||
+           (Math.abs(o.left - hitLine.left) < 6 && Math.abs(o.top - hitLine.top) < 4))
         );
 
         if (existing) {
           fabricCanvas.setActiveObject(existing);
-          existing.enterEditing();
-          fabricCanvas.requestRenderAll();
+          setTimeout(() => {
+            existing.enterEditing();
+            existing.hiddenTextarea?.focus();
+            fabricCanvas.requestRenderAll();
+          }, 30);
           return;
         }
 
@@ -700,69 +710,80 @@ function setupFabricEventListeners() {
   });
 }
 
-// Find the closest interactive textbox to the pointer
+// Find the closest interactive textbox to the pointer with generous finger tolerance
 function findClosestObject(objects, pt) {
   if (!objects || objects.length === 0) return null;
-  const pool = objects.filter(o => {
+
+  const candidates = [];
+
+  for (const o of objects) {
     const w = o.getScaledWidth ? o.getScaledWidth() : (o.width || 0);
     const h = o.getScaledHeight ? o.getScaledHeight() : (o.height || 0);
-    return (
-      pt.x >= o.left - 8 &&
-      pt.x <= o.left + w + 8 &&
-      pt.y >= o.top - 4 &&
-      pt.y <= o.top + h + 4
-    );
-  });
-  if (pool.length === 0) return null;
-
-  let best = null;
-  let minDiff = Infinity;
-  for (const o of pool) {
-    const h = o.getScaledHeight ? o.getScaledHeight() : (o.height || 0);
     const centerY = o.top + h / 2;
-    const diff = Math.abs(pt.y - centerY);
-    if (diff < minDiff) {
-      minDiff = diff;
-      best = o;
+    const vDist = Math.abs(pt.y - centerY);
+    const maxV = Math.max(22, (o.fontSize || 16) * 1.35);
+
+    if (vDist <= maxV) {
+      const inX = (pt.x >= o.left - 18 && pt.x <= o.left + w + 22);
+      let score = vDist;
+      if (!inX) {
+        const xDist = (pt.x < o.left) ? (o.left - pt.x) : (pt.x - (o.left + w));
+        if (xDist > 40) continue;
+        score += xDist * 1.5;
+      }
+      candidates.push({ obj: o, score, vDist });
     }
   }
-  return best;
+
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => a.score - b.score);
+  return candidates[0].obj;
 }
 
-// Find the closest PDF extracted text line to the pointer
+// Find the closest PDF extracted text line to the pointer with generous finger tolerance
 function findClosestTextLine(lines, pt) {
   if (!lines || lines.length === 0) return null;
 
-  // 1. Strict pool: pointer is directly inside horizontal bounds and very close vertically
-  const strictPool = lines.filter(l => 
-    pt.x >= l.left - 6 &&
-    pt.x <= l.left + l.width + 6 &&
-    pt.y >= l.top - 2 &&
-    pt.y <= l.top + l.height + 2
-  );
+  const candidates = [];
 
-  // 2. Fallback pool: slightly wider tolerance for mobile finger tapping
-  const pool = strictPool.length > 0 ? strictPool : lines.filter(l =>
-    pt.x >= l.left - 12 &&
-    pt.x <= l.left + l.width + 12 &&
-    pt.y >= l.top - 6 &&
-    pt.y <= l.top + l.height + 6
-  );
-
-  if (pool.length === 0) return null;
-
-  // Pick the line whose vertical center is closest to pointer.y
-  let best = null;
-  let minDiff = Infinity;
-  for (const line of pool) {
+  for (const line of lines) {
     const centerY = line.top + line.height / 2;
-    const diff = Math.abs(pt.y - centerY);
-    if (diff < minDiff) {
-      minDiff = diff;
-      best = line;
+    const vDist = Math.abs(pt.y - centerY);
+    const maxV = Math.max(22, line.canvasFontSize * 1.35);
+
+    // If pointer is within vertical range of this line
+    if (vDist <= maxV) {
+      const inX = (pt.x >= line.left - 18 && pt.x <= line.left + line.width + 22);
+      let score = vDist;
+      if (!inX) {
+        // If not directly inside X, penalize distance by horizontal offset
+        const xDist = (pt.x < line.left) ? (line.left - pt.x) : (pt.x - (line.left + line.width));
+        if (xDist > 40) continue; // Too far horizontally
+        score += xDist * 1.5;
+      }
+      candidates.push({ line, score, vDist });
     }
   }
-  return best;
+
+  if (candidates.length === 0) {
+    // Fallback: check 2D distance to center of each line (within 45px)
+    let bestLine = null;
+    let minD = 45;
+    for (const line of lines) {
+      const cx = line.left + line.width / 2;
+      const cy = line.top + line.height / 2;
+      const d = Math.hypot(pt.x - cx, pt.y - cy);
+      if (d < minD) {
+        minD = d;
+        bestLine = line;
+      }
+    }
+    return bestLine;
+  }
+
+  // Pick the line with the lowest score (closest vertical & horizontal)
+  candidates.sort((a, b) => a.score - b.score);
+  return candidates[0].line;
 }
 
 // Convert a single extracted text line to a Word-like interactive in-place Textbox
@@ -779,12 +800,12 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
     left: Math.max(0, line.left - 2),
     top: Math.max(0, line.top - 1),
     width: line.width + 4,
-    height: Math.max(line.height + 2, line.canvasFontSize * 1.12),
+    height: Math.max(line.height + 2, line.canvasFontSize * 1.15),
     fill: colors.bgColor,
     selectable: false,
     evented: false,
     strokeWidth: 0,
-    data: { isMask: true, id: maskId, linkedTextId: textId },
+    data: { isMask: true, id: maskId, lineId: line.id, linkedTextId: textId },
   });
   fabricCanvas.add(maskRect);
 
@@ -792,7 +813,7 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
   const textbox = new fabric.Textbox(line.text, {
     left: line.left,
     top: line.top,
-    width: Math.max(line.width + 6, 40),
+    width: Math.max(line.width + 8, 40),
     fontSize: line.canvasFontSize,
     fill: colors.textColor,
     fontFamily: line.fontFamily || 'system-ui, -apple-system, sans-serif',
@@ -811,6 +832,7 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
     data: {
       isText: true,
       id: textId,
+      lineId: line.id,
       linkedMaskId: maskId,
       originalText: line.text,
       isBoldOriginal: isBoldFinal,
@@ -821,8 +843,12 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
 
   if (shouldEditImmediately) {
     fabricCanvas.setActiveObject(textbox);
-    textbox.enterEditing();
-    textbox.selectAll();
+    setTimeout(() => {
+      textbox.enterEditing();
+      textbox.selectAll();
+      textbox.hiddenTextarea?.focus();
+      fabricCanvas.requestRenderAll();
+    }, 50);
     showToast('已进入 Word 修改模式，直接打字替换！', 'info');
   }
 
@@ -858,8 +884,8 @@ async function convertAllTextToEditable() {
     // Avoid creating duplicates if a textbox already covers this position
     const alreadyExists = fabricCanvas.getObjects().some(o => 
       o.data?.isText &&
-      Math.abs(o.left - line.left) < 15 &&
-      Math.abs(o.top - line.top) < 15
+      (o.data?.lineId === line.id || 
+       (Math.abs(o.left - line.left) < 6 && Math.abs(o.top - line.top) < 4))
     );
 
     if (!alreadyExists) {
@@ -886,7 +912,16 @@ async function convertAllTextToEditable() {
 function isFontBold(page, fontName) {
   if (!fontName) return false;
   const fnLower = fontName.toLowerCase();
-  if (fnLower.includes('bold') || fnLower.includes('black') || fnLower.includes('heavy') || fnLower.includes('demi') || fnLower.includes('semi')) {
+  if (
+    fnLower.includes('bold') ||
+    fnLower.includes('black') ||
+    fnLower.includes('heavy') ||
+    fnLower.includes('demi') ||
+    fnLower.includes('semi') ||
+    fnLower.endsWith('bd') ||
+    fnLower.includes('-b') ||
+    fnLower.includes('_b')
+  ) {
     return true;
   }
   try {
@@ -898,9 +933,18 @@ function isFontBold(page, fontName) {
     }
     if (fontObj) {
       if (fontObj.bold === true || fontObj.black === true) return true;
-      if (fontObj.weight && fontObj.weight >= 600) return true;
+      if (fontObj.weight && (fontObj.weight >= 600 || fontObj.weight === 'bold')) return true;
       const realName = (fontObj.name || fontObj.loadedName || fontObj.fallbackName || '').toLowerCase();
-      if (realName.includes('bold') || realName.includes('black') || realName.includes('heavy') || realName.includes('demi') || realName.includes('semi')) {
+      if (
+        realName.includes('bold') ||
+        realName.includes('black') ||
+        realName.includes('heavy') ||
+        realName.includes('demi') ||
+        realName.includes('semi') ||
+        realName.endsWith('bd') ||
+        realName.includes('-b') ||
+        realName.includes('_b')
+      ) {
         return true;
       }
     }
@@ -939,7 +983,7 @@ async function extractPageTextLines(page, viewport) {
       const [vx, vy] = viewport.convertToViewportPoint(it.transform[4], it.transform[5]);
       const pdfFontSize = Math.hypot(it.transform[0], it.transform[1]) || 12;
       const canvasFontSize = Math.round(pdfFontSize * state.baseScale);
-      const width = it.width * state.baseScale;
+      const width = Math.max(it.width * state.baseScale, it.str.length * canvasFontSize * 0.52);
       const height = (it.height || pdfFontSize) * state.baseScale;
       const top = vy - canvasFontSize * 0.95;
 
@@ -992,11 +1036,15 @@ async function extractPageTextLines(page, viewport) {
         currentLine.canvasFontSize = Math.max(currentLine.canvasFontSize, item.canvasFontSize);
         currentLine.items.push(item);
       } else {
+        currentLine.id = 'line_p' + (page.pageNumber || state.currentPage) + '_' + lines.length;
         lines.push(currentLine);
         currentLine = { ...item, text: item.str, items: [item] };
       }
     }
-    if (currentLine) lines.push(currentLine);
+    if (currentLine) {
+      currentLine.id = 'line_p' + (page.pageNumber || state.currentPage) + '_' + lines.length;
+      lines.push(currentLine);
+    }
     return lines;
   } catch (err) {
     console.warn('Failed to extract page text lines:', err);
@@ -1701,6 +1749,7 @@ function setupEventListeners() {
       obj.set('fontSize', Math.max(10, (obj.fontSize || 16) - 2));
       elements.labelFontSize.textContent = Math.round(obj.fontSize);
       fabricCanvas.requestRenderAll();
+      saveCurrentPageState(state.currentPage);
     }
   });
   elements.btnFontPlus.addEventListener('click', () => {
@@ -1709,6 +1758,7 @@ function setupEventListeners() {
       obj.set('fontSize', Math.min(72, (obj.fontSize || 16) + 2));
       elements.labelFontSize.textContent = Math.round(obj.fontSize);
       fabricCanvas.requestRenderAll();
+      saveCurrentPageState(state.currentPage);
     }
   });
   elements.btnTextBold.addEventListener('click', () => {
@@ -1722,6 +1772,7 @@ function setupEventListeners() {
       }
       updatePropertyBar();
       fabricCanvas.requestRenderAll();
+      saveCurrentPageState(state.currentPage);
       showToast(isBold ? '已取消加粗' : '已设置为加粗', 'info');
     }
   });
@@ -1730,6 +1781,7 @@ function setupEventListeners() {
     if (obj && (obj.type === 'textbox' || obj.type === 'i-text')) {
       obj.set('fill', e.target.value);
       fabricCanvas.requestRenderAll();
+      saveCurrentPageState(state.currentPage);
     }
   });
   document.querySelectorAll('.text-color-swatch').forEach(btn => {
@@ -1740,6 +1792,7 @@ function setupEventListeners() {
         obj.set('fill', color);
         elements.inputTextColor.value = color;
         fabricCanvas.requestRenderAll();
+        saveCurrentPageState(state.currentPage);
       }
     });
   });
