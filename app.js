@@ -525,23 +525,36 @@ function setupFabricEventListeners() {
 
     // 1. Smart Word-like "Tap to Edit"
     if (state.tool === 'tap-edit') {
-      const clickedTarget = opt.target;
-      // If clicked on an existing textbox
-      if (clickedTarget && (clickedTarget.type === 'textbox' || clickedTarget.type === 'i-text')) {
-        fabricCanvas.setActiveObject(clickedTarget);
-        clickedTarget.enterEditing();
+      const activeObj = fabricCanvas.getActiveObject();
+
+      // If an object is currently editing, check if user clicked outside its strict bounds
+      if (activeObj && activeObj.isEditing) {
+        const inActive = (
+          pointer.x >= activeObj.left - 2 &&
+          pointer.x <= activeObj.left + activeObj.getScaledWidth() + 2 &&
+          pointer.y >= activeObj.top - 2 &&
+          pointer.y <= activeObj.top + activeObj.getScaledHeight() + 2
+        );
+
+        if (!inActive) {
+          activeObj.exitEditing();
+          fabricCanvas.discardActiveObject();
+        }
+      }
+
+      // Check all existing textboxes first (closest match)
+      const textboxes = fabricCanvas.getObjects().filter(o => o.data?.isText);
+      const hitBox = findClosestObject(textboxes, pointer);
+      if (hitBox) {
+        fabricCanvas.setActiveObject(hitBox);
+        hitBox.enterEditing();
+        fabricCanvas.requestRenderAll();
         return;
       }
 
-      // Check if clicked directly on underlying original PDF text
+      // If not an existing textbox, check extracted text lines from the PDF
       const lines = state.pageTextLines[state.currentPage] || [];
-      const padding = 8;
-      const hitLine = lines.find(l => 
-        pointer.x >= l.left - padding &&
-        pointer.x <= l.left + l.width + padding &&
-        pointer.y >= l.top - padding &&
-        pointer.y <= l.top + l.height + padding
-      );
+      const hitLine = findClosestTextLine(lines, pointer);
 
       if (hitLine) {
         // Check if an existing textbox already covers this line
@@ -687,6 +700,71 @@ function setupFabricEventListeners() {
   });
 }
 
+// Find the closest interactive textbox to the pointer
+function findClosestObject(objects, pt) {
+  if (!objects || objects.length === 0) return null;
+  const pool = objects.filter(o => {
+    const w = o.getScaledWidth ? o.getScaledWidth() : (o.width || 0);
+    const h = o.getScaledHeight ? o.getScaledHeight() : (o.height || 0);
+    return (
+      pt.x >= o.left - 8 &&
+      pt.x <= o.left + w + 8 &&
+      pt.y >= o.top - 4 &&
+      pt.y <= o.top + h + 4
+    );
+  });
+  if (pool.length === 0) return null;
+
+  let best = null;
+  let minDiff = Infinity;
+  for (const o of pool) {
+    const h = o.getScaledHeight ? o.getScaledHeight() : (o.height || 0);
+    const centerY = o.top + h / 2;
+    const diff = Math.abs(pt.y - centerY);
+    if (diff < minDiff) {
+      minDiff = diff;
+      best = o;
+    }
+  }
+  return best;
+}
+
+// Find the closest PDF extracted text line to the pointer
+function findClosestTextLine(lines, pt) {
+  if (!lines || lines.length === 0) return null;
+
+  // 1. Strict pool: pointer is directly inside horizontal bounds and very close vertically
+  const strictPool = lines.filter(l => 
+    pt.x >= l.left - 6 &&
+    pt.x <= l.left + l.width + 6 &&
+    pt.y >= l.top - 2 &&
+    pt.y <= l.top + l.height + 2
+  );
+
+  // 2. Fallback pool: slightly wider tolerance for mobile finger tapping
+  const pool = strictPool.length > 0 ? strictPool : lines.filter(l =>
+    pt.x >= l.left - 12 &&
+    pt.x <= l.left + l.width + 12 &&
+    pt.y >= l.top - 6 &&
+    pt.y <= l.top + l.height + 6
+  );
+
+  if (pool.length === 0) return null;
+
+  // Pick the line whose vertical center is closest to pointer.y
+  let best = null;
+  let minDiff = Infinity;
+  for (const line of pool) {
+    const centerY = line.top + line.height / 2;
+    const diff = Math.abs(pt.y - centerY);
+    if (diff < minDiff) {
+      minDiff = diff;
+      best = line;
+    }
+  }
+  return best;
+}
+
 // Convert a single extracted text line to a Word-like interactive in-place Textbox
 function convertLineToTextbox(line, shouldEditImmediately = true) {
   // 1. Sample surrounding background color and text contrast color
@@ -695,12 +773,12 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
   const maskId = 'mask_' + Math.random().toString(36).substr(2, 9);
   const textId = 'text_' + Math.random().toString(36).substr(2, 9);
 
-  // 2. Solid background mask perfectly covers original PDF text
+  // 2. Solid background mask perfectly covers original PDF text (tight vertical bounds)
   const maskRect = new fabric.Rect({
     left: Math.max(0, line.left - 2),
-    top: Math.max(0, line.top - 2),
+    top: Math.max(0, line.top - 1),
     width: line.width + 4,
-    height: Math.max(line.height + 4, line.canvasFontSize * 1.25),
+    height: Math.max(line.height + 2, line.canvasFontSize * 1.12),
     fill: colors.bgColor,
     selectable: false,
     evented: false,
@@ -713,7 +791,7 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
   const textbox = new fabric.Textbox(line.text, {
     left: line.left,
     top: line.top,
-    width: Math.max(line.width + 8, 50),
+    width: Math.max(line.width + 6, 40),
     fontSize: line.canvasFontSize,
     fill: colors.textColor,
     fontFamily: 'system-ui, -apple-system, sans-serif',
@@ -722,12 +800,13 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
     hasBorders: true,
     borderColor: '#3b82f6',
     borderDashArray: [3, 3],
-    borderScaleFactor: 1.2,
-    padding: 2,
+    borderScaleFactor: 1.0,
+    padding: 0,            // 0 padding so vertical bounds do not collide with neighboring lines
+    lineHeight: 1.05,      // compact line height so bottom doesn't cover the line below
     transparentCorners: false,
     cornerColor: '#2563eb',
-    cornerSize: 10,
-    touchCornerSize: 26,
+    cornerSize: 8,         // compact handles
+    touchCornerSize: 14,   // sensible touch radius, won't shadow adjacent lines
     data: {
       isText: true,
       id: textId,
@@ -850,11 +929,11 @@ async function extractPageTextLines(page, viewport) {
         continue;
       }
 
-      const sameBaseline = Math.abs(currentLine.vy - item.vy) <= Math.max(5, item.canvasFontSize * 0.35);
+      const sameBaseline = Math.abs(currentLine.vy - item.vy) <= Math.max(6, item.canvasFontSize * 0.45);
       const xGap = item.left - (currentLine.left + currentLine.width);
 
-      if (sameBaseline && xGap < item.canvasFontSize * 1.8 && xGap > -15) {
-        const addSpace = (xGap > 2 && !currentLine.text.endsWith(' ') && !item.str.startsWith(' ')) ? ' ' : '';
+      if (sameBaseline && xGap < item.canvasFontSize * 3.0 && xGap > -25) {
+        const addSpace = (xGap > 1 && !currentLine.text.endsWith(' ') && !item.str.startsWith(' ')) ? ' ' : '';
         currentLine.text += addSpace + item.str;
         currentLine.width = (item.left + item.width) - currentLine.left;
         currentLine.height = Math.max(currentLine.height, item.height);
