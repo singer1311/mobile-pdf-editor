@@ -769,6 +769,7 @@ function findClosestTextLine(lines, pt) {
 function convertLineToTextbox(line, shouldEditImmediately = true) {
   // 1. Sample surrounding background color and text contrast color
   const colors = samplePdfColors(line.left, line.top, line.width, line.height);
+  const isBoldFinal = Boolean(line.isBold);
 
   const maskId = 'mask_' + Math.random().toString(36).substr(2, 9);
   const textId = 'text_' + Math.random().toString(36).substr(2, 9);
@@ -787,15 +788,15 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
   });
   fabricCanvas.add(maskRect);
 
-  // 3. In-place editable Textbox preserving original font size, color, weight
+  // 3. In-place editable Textbox preserving original font size, color, weight, and font family
   const textbox = new fabric.Textbox(line.text, {
     left: line.left,
     top: line.top,
     width: Math.max(line.width + 6, 40),
     fontSize: line.canvasFontSize,
     fill: colors.textColor,
-    fontFamily: 'system-ui, -apple-system, sans-serif',
-    fontWeight: line.isBold ? 'bold' : 'normal',
+    fontFamily: line.fontFamily || 'system-ui, -apple-system, sans-serif',
+    fontWeight: isBoldFinal ? 'bold' : 'normal',
     editable: true,
     hasBorders: true,
     borderColor: '#3b82f6',
@@ -812,6 +813,7 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
       id: textId,
       linkedMaskId: maskId,
       originalText: line.text,
+      isBoldOriginal: isBoldFinal,
     },
   });
 
@@ -880,6 +882,52 @@ async function convertAllTextToEditable() {
   }
 }
 
+// Accurately detect whether a font is bold using PDF.js font descriptor metadata & name patterns
+function isFontBold(page, fontName) {
+  if (!fontName) return false;
+  const fnLower = fontName.toLowerCase();
+  if (fnLower.includes('bold') || fnLower.includes('black') || fnLower.includes('heavy') || fnLower.includes('demi') || fnLower.includes('semi')) {
+    return true;
+  }
+  try {
+    let fontObj = null;
+    if (page?.commonObjs?.has && page.commonObjs.has(fontName)) {
+      fontObj = page.commonObjs.get(fontName);
+    } else if (page?.objs?.has && page.objs.has(fontName)) {
+      fontObj = page.objs.get(fontName);
+    }
+    if (fontObj) {
+      if (fontObj.bold === true || fontObj.black === true) return true;
+      if (fontObj.weight && fontObj.weight >= 600) return true;
+      const realName = (fontObj.name || fontObj.loadedName || fontObj.fallbackName || '').toLowerCase();
+      if (realName.includes('bold') || realName.includes('black') || realName.includes('heavy') || realName.includes('demi') || realName.includes('semi')) {
+        return true;
+      }
+    }
+  } catch (e) {
+    console.warn('isFontBold error:', e);
+  }
+  return false;
+}
+
+// Detect font family category (serif vs sans-serif vs monospace)
+function detectFontFamily(page, fontName) {
+  if (!fontName) return 'system-ui, -apple-system, sans-serif';
+  try {
+    let fontObj = null;
+    if (page?.commonObjs?.has && page.commonObjs.has(fontName)) {
+      fontObj = page.commonObjs.get(fontName);
+    } else if (page?.objs?.has && page.objs.has(fontName)) {
+      fontObj = page.objs.get(fontName);
+    }
+    if (fontObj) {
+      if (fontObj.isMonospace) return 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+      if (fontObj.isSerifFont) return 'Georgia, Cambria, "Times New Roman", Times, serif';
+    }
+  } catch (e) {}
+  return 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+}
+
 // Extract and cluster text items from PDF.js into coherent text lines
 async function extractPageTextLines(page, viewport) {
   try {
@@ -895,12 +943,13 @@ async function extractPageTextLines(page, viewport) {
       const height = (it.height || pdfFontSize) * state.baseScale;
       const top = vy - canvasFontSize * 0.95;
 
-      const fn = (it.fontName || '').toLowerCase();
-      const isBold = fn.includes('bold') || fn.includes('black') || fn.includes('heavy') || fn.includes('f1');
+      const isBold = isFontBold(page, it.fontName);
+      const fontFamily = detectFontFamily(page, it.fontName);
 
       return {
         str: it.str,
         fontName: it.fontName || '',
+        fontFamily,
         isBold,
         canvasFontSize,
         pdfFontSize,
@@ -931,14 +980,16 @@ async function extractPageTextLines(page, viewport) {
 
       const sameBaseline = Math.abs(currentLine.vy - item.vy) <= Math.max(6, item.canvasFontSize * 0.45);
       const xGap = item.left - (currentLine.left + currentLine.width);
+      const sameWeight = (currentLine.isBold === item.isBold);
 
-      if (sameBaseline && xGap < item.canvasFontSize * 3.0 && xGap > -25) {
+      // Only merge if on the same baseline, reasonably close, AND sharing the same bold style!
+      // This preserves bold dates, numbers, and bold terms (like "Nov 15, 2023.") without collapsing!
+      if (sameBaseline && sameWeight && xGap < item.canvasFontSize * 3.0 && xGap > -25) {
         const addSpace = (xGap > 1 && !currentLine.text.endsWith(' ') && !item.str.startsWith(' ')) ? ' ' : '';
         currentLine.text += addSpace + item.str;
         currentLine.width = (item.left + item.width) - currentLine.left;
         currentLine.height = Math.max(currentLine.height, item.height);
         currentLine.canvasFontSize = Math.max(currentLine.canvasFontSize, item.canvasFontSize);
-        currentLine.isBold = currentLine.isBold || item.isBold;
         currentLine.items.push(item);
       } else {
         lines.push(currentLine);
@@ -1664,9 +1715,14 @@ function setupEventListeners() {
     const obj = fabricCanvas?.getActiveObject();
     if (obj && (obj.type === 'textbox' || obj.type === 'i-text')) {
       const isBold = (obj.fontWeight === 'bold');
-      obj.set('fontWeight', isBold ? 'normal' : 'bold');
+      const targetWeight = isBold ? 'normal' : 'bold';
+      obj.set('fontWeight', targetWeight);
+      if (obj.isEditing && obj.selectionStart !== obj.selectionEnd) {
+        obj.setSelectionStyles({ fontWeight: targetWeight });
+      }
       updatePropertyBar();
       fabricCanvas.requestRenderAll();
+      showToast(isBold ? '已取消加粗' : '已设置为加粗', 'info');
     }
   });
   elements.inputTextColor.addEventListener('input', (e) => {
