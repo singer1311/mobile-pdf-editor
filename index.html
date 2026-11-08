@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes, viewport-fit=cover">
+  <title>MobilePDF - 移动端 PDF 原样修改与解密工具</title>
+  <meta name="description" content="专为手机端与桌面端设计的纯前端 PDF 原样修改 Web App，支持密码解锁、遮盖改字、签名批注与无密码解密导出">
+  
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: {
+              50: '#eff6ff',
+              100: '#dbeafe',
+              500: '#3b82f6',
+              600: '#2563eb',
+              700: '#1d4ed8',
+            }
+          }
+        }
+      }
+    }
+  </script>
+
+  <!-- FontAwesome Icons -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+
+  <!-- Core Libraries -->
+  <!-- PDF.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <!-- Fabric.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/fabric.js/5.3.1/fabric.min.js"></script>
+  <!-- pdf-lib -->
+  <script src="https://unpkg.com/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+  <!-- canvas-confetti -->
+  <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.2/dist/confetti.browser.min.js"></script>
+
+  <!-- Custom Stylesheet -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="bg-slate-100 text-slate-800 antialiased select-none overflow-hidden h-screen flex flex-col font-sans">
+
+  <!-- Top Application Bar -->
+  <header class="bg-white/95 backdrop-blur-md border-b border-slate-200 z-30 px-3 py-2 flex items-center justify-between shadow-sm shrink-0">
+    <!-- Brand / File Title -->
+    <div class="flex items-center space-x-2 min-w-0">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-tr from-blue-600 to-indigo-500 flex items-center justify-center text-white shadow-sm shrink-0">
+        <i class="fa-solid fa-file-signature text-sm"></i>
+      </div>
+      <div class="min-w-0 hidden sm:block">
+        <h1 class="text-sm font-bold text-slate-900 leading-tight truncate">MobilePDF 原样修改器</h1>
+        <p id="file-name-label" class="text-xs text-slate-500 truncate max-w-[160px] md:max-w-[260px]">未选择文件</p>
+      </div>
+    </div>
+
+    <!-- Center: Page Controls -->
+    <div id="page-nav-controls" class="hidden flex items-center bg-slate-100/90 rounded-full p-1 border border-slate-200">
+      <button id="btn-prev-page" class="w-8 h-8 rounded-full flex items-center justify-center text-slate-700 hover:bg-white active:bg-slate-200 transition disabled:opacity-30 disabled:pointer-events-none" title="上一页">
+        <i class="fa-solid fa-chevron-left text-xs"></i>
+      </button>
+      <div class="px-2 text-xs font-semibold text-slate-700 whitespace-nowrap">
+        <span id="current-page-num">1</span> / <span id="total-page-num">1</span>
+      </div>
+      <button id="btn-next-page" class="w-8 h-8 rounded-full flex items-center justify-center text-slate-700 hover:bg-white active:bg-slate-200 transition disabled:opacity-30 disabled:pointer-events-none" title="下一页">
+        <i class="fa-solid fa-chevron-right text-xs"></i>
+      </button>
+    </div>
+
+    <!-- Right Controls: Mode Toggle & Export -->
+    <div class="flex items-center space-x-1.5 sm:space-x-2">
+      <!-- Hidden file input -->
+      <input type="file" id="pdf-file-input" accept="application/pdf" class="hidden">
+      
+      <!-- Open PDF Button -->
+      <button id="btn-open-pdf" class="px-2.5 sm:px-3 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 active:bg-slate-300 rounded-lg flex items-center space-x-1.5 transition">
+        <i class="fa-solid fa-folder-open text-blue-600"></i>
+        <span class="hidden sm:inline">打开</span>
+      </button>
+
+      <!-- Mode Switcher Pill (Browse 🖐️ vs Edit ✏️) -->
+      <div id="mode-switch-group" class="hidden items-center bg-slate-200 p-0.5 rounded-lg border border-slate-300">
+        <button id="btn-mode-browse" class="px-2 sm:px-2.5 py-1 text-xs font-semibold rounded-md flex items-center space-x-1 transition text-slate-600 hover:text-slate-900" title="浏览/缩放模式：手指拖动平移，双指缩放">
+          <i class="fa-solid fa-hand text-xs"></i>
+          <span class="hidden md:inline">浏览</span>
+        </button>
+        <button id="btn-mode-edit" class="px-2 sm:px-2.5 py-1 text-xs font-semibold rounded-md flex items-center space-x-1 transition bg-white text-blue-600 shadow-sm" title="编辑模式：点击或框选进行修改">
+          <i class="fa-solid fa-pen-to-square text-xs"></i>
+          <span class="hidden md:inline">编辑</span>
+        </button>
+      </div>
+
+      <!-- Export / Save Button -->
+      <button id="btn-export-pdf" class="px-3 sm:px-4 py-1.5 text-xs font-semibold text-white bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 active:scale-95 shadow-md shadow-blue-500/20 rounded-lg flex items-center space-x-1.5 transition disabled:opacity-40 disabled:pointer-events-none">
+        <i class="fa-solid fa-cloud-arrow-down"></i>
+        <span>保存导出</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- Floating Quick Zoom HUD (Top Right, Mobile Optimized) -->
+  <div id="floating-zoom-hud" class="hidden absolute top-14 right-3 z-20 bg-white/90 backdrop-blur-md border border-slate-200/90 shadow-lg rounded-full px-2 py-1 flex items-center space-x-1 text-slate-700">
+    <button id="btn-zoom-out" class="w-7 h-7 rounded-full flex items-center justify-center hover:bg-slate-100 active:bg-slate-200 transition text-xs" title="缩小 (-25%)">
+      <i class="fa-solid fa-minus"></i>
+    </button>
+    <button id="btn-zoom-reset" class="px-1.5 py-0.5 text-xs font-bold text-slate-800 hover:text-blue-600 transition" title="重置 100%">
+      <span id="zoom-percentage-label">100%</span>
+    </button>
+    <button id="btn-zoom-in" class="w-7 h-7 rounded-full flex items-center justify-center hover:bg-slate-100 active:bg-slate-200 transition text-xs" title="放大 (+25%)">
+      <i class="fa-solid fa-plus"></i>
+    </button>
+    <div class="h-3.5 w-px bg-slate-300 mx-0.5"></div>
+    <button id="btn-zoom-fit" class="px-2 py-1 text-[11px] font-medium text-slate-600 hover:text-blue-600 active:bg-slate-100 rounded-md transition" title="适应屏幕宽度">
+      适应
+    </button>
+    <button id="btn-zoom-200" class="px-2 py-1 text-[11px] font-medium text-slate-600 hover:text-blue-600 active:bg-slate-100 rounded-md transition" title="200% 局部特写">
+      200%
+    </button>
+  </div>
+
+  <!-- Main Viewport Workspace -->
+  <main id="viewport-wrapper" class="flex-1 relative overflow-auto touch-pan-x touch-pan-y bg-slate-200/80 flex items-start justify-center p-2 sm:p-4">
+    
+    <!-- Empty State / Welcome Dropzone -->
+    <div id="empty-state" class="my-auto max-w-lg w-full bg-white rounded-2xl shadow-xl border border-slate-200 p-6 sm:p-8 text-center animate-fade-in">
+      <div class="w-16 h-16 bg-blue-50 text-blue-600 rounded-2xl flex items-center justify-center mx-auto mb-4 text-2xl shadow-inner">
+        <i class="fa-solid fa-file-pdf"></i>
+      </div>
+      <h2 class="text-xl font-bold text-slate-900 mb-2">纯前端 PDF 原样修改器</h2>
+      <p class="text-sm text-slate-600 mb-6 leading-relaxed">
+        手机与电脑通用 · 原样擦除改字 · 密码解锁导出 · 手写签名 · 100% 本地浏览器处理不泄露隐私
+      </p>
+
+      <!-- Upload Button Trigger -->
+      <button id="btn-dropzone-upload" class="w-full py-3.5 px-4 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white font-semibold rounded-xl shadow-lg shadow-blue-500/25 active:scale-[0.98] transition flex items-center justify-center space-x-2 mb-4">
+        <i class="fa-solid fa-arrow-up-from-bracket"></i>
+        <span>选择本地 PDF 文件</span>
+      </button>
+
+      <!-- Quick Demo Cards -->
+      <div class="border-t border-slate-100 pt-5 mt-5">
+        <p class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">或者立即体验样例</p>
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <button id="btn-load-sample-contract" class="p-3 text-left bg-slate-50 hover:bg-blue-50/70 border border-slate-200 hover:border-blue-300 rounded-xl transition group">
+            <div class="flex items-center space-x-2 mb-1 text-slate-800 group-hover:text-blue-600 font-medium text-xs">
+              <i class="fa-solid fa-file-contract text-blue-500"></i>
+              <span>商务合作协议样例</span>
+            </div>
+            <p class="text-[11px] text-slate-500">体验遮盖改字、修改金额与添加签名</p>
+          </button>
+
+          <button id="btn-load-sample-encrypted" class="p-3 text-left bg-slate-50 hover:bg-amber-50/70 border border-slate-200 hover:border-amber-300 rounded-xl transition group">
+            <div class="flex items-center space-x-2 mb-1 text-slate-800 group-hover:text-amber-600 font-medium text-xs">
+              <i class="fa-solid fa-lock text-amber-500"></i>
+              <span>密码加密测试样例</span>
+            </div>
+            <p class="text-[11px] text-slate-500">测试密码解锁与解密导出 (密码: test)</p>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Active PDF Canvas Stage -->
+    <div id="workspace-view" class="hidden relative my-auto transition-transform duration-75 origin-top-left">
+      <!-- Canvas Stacking Container -->
+      <div id="canvas-container" class="relative bg-white shadow-2xl rounded-sm overflow-hidden border border-slate-300">
+        <!-- Bottom: PDF.js high-res rendered canvas -->
+        <canvas id="pdf-canvas" class="block"></canvas>
+        <!-- Top: Fabric.js interactive overlay canvas -->
+        <div id="fabric-wrapper" class="absolute top-0 left-0 w-full h-full pointer-events-auto">
+          <canvas id="fabric-canvas"></canvas>
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- Contextual Floating Property Bar (Floats right above bottom toolbar when object selected) -->
+  <div id="contextual-property-bar" class="hidden fixed bottom-[72px] sm:bottom-[76px] left-1/2 -translate-x-1/2 z-30 bg-slate-900/90 text-white backdrop-blur-md px-3 py-1.5 rounded-full shadow-xl flex items-center space-x-2 text-xs border border-slate-700/60 transition-all max-w-[94vw] overflow-x-auto">
+    <!-- Text Controls -->
+    <div id="text-prop-controls" class="flex items-center space-x-2 shrink-0">
+      <span class="text-slate-400 text-[11px]">字号:</span>
+      <button id="btn-font-minus" class="w-6 h-6 rounded-full bg-slate-800 hover:bg-slate-700 active:bg-slate-600 flex items-center justify-center text-[10px]">
+        <i class="fa-solid fa-minus"></i>
+      </button>
+      <span id="label-font-size" class="w-6 text-center font-bold">16</span>
+      <button id="btn-font-plus" class="w-6 h-6 rounded-full bg-slate-800 hover:bg-slate-700 active:bg-slate-600 flex items-center justify-center text-[10px]">
+        <i class="fa-solid fa-plus"></i>
+      </button>
+
+      <div class="h-3.5 w-px bg-slate-700 mx-1"></div>
+
+      <!-- Text Color Swatches -->
+      <button class="w-5 h-5 rounded-full bg-slate-900 border border-white/60 active:scale-90 text-color-swatch" data-color="#111827" title="黑色"></button>
+      <button class="w-5 h-5 rounded-full bg-red-600 active:scale-90 text-color-swatch" data-color="#dc2626" title="印章红"></button>
+      <button class="w-5 h-5 rounded-full bg-blue-600 active:scale-90 text-color-swatch" data-color="#2563eb" title="商务蓝"></button>
+      <input type="color" id="input-text-color" class="w-5 h-5 rounded-full bg-transparent border-0 cursor-pointer p-0" title="自选颜色" value="#111827">
+
+      <div class="h-3.5 w-px bg-slate-700 mx-1"></div>
+
+      <button id="btn-text-bold" class="w-6 h-6 rounded bg-slate-800 hover:bg-slate-700 flex items-center justify-center font-bold text-xs" title="加粗">B</button>
+    </div>
+
+    <!-- Mask Controls -->
+    <div id="mask-prop-controls" class="hidden flex items-center space-x-2 shrink-0">
+      <span class="text-slate-400 text-[11px]">遮罩颜色:</span>
+      <button class="w-5 h-5 rounded-full bg-white border border-slate-300 mask-color-swatch" data-color="#ffffff" title="纯白"></button>
+      <button class="w-5 h-5 rounded-full bg-slate-100 border border-slate-300 mask-color-swatch" data-color="#f8fafc" title="纸灰"></button>
+      <button class="w-5 h-5 rounded-full bg-amber-50 border border-slate-300 mask-color-swatch" data-color="#fef3c7" title="微黄"></button>
+      <input type="color" id="input-mask-color" class="w-5 h-5 rounded-full bg-transparent border-0 cursor-pointer p-0" title="自选遮罩色" value="#ffffff">
+    </div>
+
+    <!-- Brush Controls -->
+    <div id="brush-prop-controls" class="hidden flex items-center space-x-2 shrink-0">
+      <span class="text-slate-400 text-[11px]">粗细:</span>
+      <input type="range" id="brush-width-slider" min="1" max="20" value="3" class="w-16 accent-blue-500 h-1 bg-slate-700 rounded-lg">
+      <div class="h-3.5 w-px bg-slate-700 mx-1"></div>
+      <button class="w-5 h-5 rounded-full bg-red-600 brush-color-swatch" data-color="#dc2626"></button>
+      <button class="w-5 h-5 rounded-full bg-blue-600 brush-color-swatch" data-color="#2563eb"></button>
+      <button class="w-5 h-5 rounded-full bg-black border border-white/40 brush-color-swatch" data-color="#000000"></button>
+      <button class="w-5 h-5 rounded-full bg-amber-400 brush-color-swatch" data-color="#f59e0b"></button>
+    </div>
+
+    <div class="h-3.5 w-px bg-slate-700 mx-1"></div>
+
+    <!-- Delete Selected Object -->
+    <button id="btn-delete-selected" class="w-7 h-7 rounded-full bg-red-500/20 text-red-400 hover:bg-red-500/40 active:bg-red-500/60 flex items-center justify-center transition" title="删除选中元素">
+      <i class="fa-solid fa-trash-can text-xs"></i>
+    </button>
+  </div>
+
+  <!-- Mobile-First Bottom Docked Toolbar (Thumb-Friendly) -->
+  <footer class="bg-white/95 backdrop-blur-md border-t border-slate-200 z-30 px-2 py-1.5 shadow-[0_-4px_12px_rgba(0,0,0,0.05)] shrink-0">
+    <div class="flex items-center justify-around max-w-xl mx-auto overflow-x-auto space-x-1 no-scrollbar py-0.5">
+      
+      <!-- Tool 1: Browse/Pan -->
+      <button id="tool-browse" class="toolbar-btn flex flex-col items-center justify-center min-w-[56px] py-1 px-1.5 rounded-xl transition text-slate-600 hover:text-blue-600" data-tool="browse">
+        <div class="w-8 h-8 rounded-full flex items-center justify-center text-sm mb-0.5 tool-icon-bg">
+          <i class="fa-solid fa-hand"></i>
+        </div>
+        <span class="text-[10px] font-medium leading-none">浏览平移</span>
+      </button>
+
+      <!-- Tool 2: Cover & Edit (Core Feature) -->
+      <button id="tool-cover-edit" class="toolbar-btn flex flex-col items-center justify-center min-w-[56px] py-1 px-1.5 rounded-xl transition active-tool text-blue-600" data-tool="cover-edit">
+        <div class="w-8 h-8 rounded-full flex items-center justify-center text-sm mb-0.5 tool-icon-bg bg-blue-100 text-blue-600">
+          <i class="fa-solid fa-eraser"></i>
+        </div>
+        <span class="text-[10px] font-semibold leading-none">遮盖改字</span>
+      </button>
+
+      <!-- Tool 3: Add Text -->
+      <button id="tool-add-text" class="toolbar-btn flex flex-col items-center justify-center min-w-[56px] py-1 px-1.5 rounded-xl transition text-slate-600 hover:text-blue-600" data-tool="add-text">
+        <div class="w-8 h-8 rounded-full flex items-center justify-center text-sm mb-0.5 tool-icon-bg">
+          <i class="fa-solid fa-font"></i>
+        </div>
+        <span class="text-[10px] font-medium leading-none">添加文字</span>
+      </button>
+
+      <!-- Tool 4: Signature -->
+      <button id="tool-signature" class="toolbar-btn flex flex-col items-center justify-center min-w-[56px] py-1 px-1.5 rounded-xl transition text-slate-600 hover:text-blue-600" data-tool="signature">
+        <div class="w-8 h-8 rounded-full flex items-center justify-center text-sm mb-0.5 tool-icon-bg">
+          <i class="fa-solid fa-signature"></i>
+        </div>
+        <span class="text-[10px] font-medium leading-none">电子签名</span>
+      </button>
+
+      <!-- Tool 5: Doodle / Brush -->
+      <button id="tool-brush" class="toolbar-btn flex flex-col items-center justify-center min-w-[56px] py-1 px-1.5 rounded-xl transition text-slate-600 hover:text-blue-600" data-tool="brush">
+        <div class="w-8 h-8 rounded-full flex items-center justify-center text-sm mb-0.5 tool-icon-bg">
+          <i class="fa-solid fa-paintbrush"></i>
+        </div>
+        <span class="text-[10px] font-medium leading-none">画笔涂鸦</span>
+      </button>
+
+      <!-- Tool 6: Pure Mask / Eraser -->
+      <button id="tool-mask" class="toolbar-btn flex flex-col items-center justify-center min-w-[56px] py-1 px-1.5 rounded-xl transition text-slate-600 hover:text-blue-600" data-tool="mask">
+        <div class="w-8 h-8 rounded-full flex items-center justify-center text-sm mb-0.5 tool-icon-bg">
+          <i class="fa-regular fa-square"></i>
+        </div>
+        <span class="text-[10px] font-medium leading-none">纯色遮罩</span>
+      </button>
+
+      <!-- Tool 7: Insert Image -->
+      <label for="image-upload-input" class="toolbar-btn flex flex-col items-center justify-center min-w-[56px] py-1 px-1.5 rounded-xl transition text-slate-600 hover:text-blue-600 cursor-pointer">
+        <div class="w-8 h-8 rounded-full flex items-center justify-center text-sm mb-0.5 tool-icon-bg">
+          <i class="fa-regular fa-image"></i>
+        </div>
+        <span class="text-[10px] font-medium leading-none">插入图片</span>
+        <input type="file" id="image-upload-input" accept="image/*" class="hidden">
+      </label>
+
+      <!-- Tool 8: Undo -->
+      <button id="btn-undo" class="toolbar-btn flex flex-col items-center justify-center min-w-[50px] py-1 px-1.5 rounded-xl transition text-slate-600 hover:text-blue-600" title="撤销上一步操作">
+        <div class="w-8 h-8 rounded-full flex items-center justify-center text-sm mb-0.5 tool-icon-bg">
+          <i class="fa-solid fa-rotate-left"></i>
+        </div>
+        <span class="text-[10px] font-medium leading-none">撤销</span>
+      </button>
+
+    </div>
+  </footer>
+
+  <!-- ================= MODALS & DIALOGS ================= -->
+
+  <!-- 1. Password Unlock Modal (Clean & Seamless) -->
+  <div id="password-modal" class="hidden fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
+    <div class="bg-white rounded-2xl shadow-2xl max-w-sm w-full p-6 border border-slate-200 transform animate-scale-up">
+      <div class="w-12 h-12 bg-amber-100 text-amber-600 rounded-2xl flex items-center justify-center mx-auto mb-3 text-xl">
+        <i class="fa-solid fa-lock"></i>
+      </div>
+      <h3 class="text-lg font-bold text-center text-slate-900 mb-1">该 PDF 文件已受密码保护</h3>
+      <p class="text-xs text-center text-slate-500 mb-4 leading-relaxed">
+        请输入文档打开密码以解密渲染。导出时将自动解除密码限制，生成公开可打开的新 PDF。
+      </p>
+
+      <form id="password-form" onsubmit="return false;">
+        <div class="relative mb-3">
+          <input type="password" id="password-input" placeholder="输入访问密码..." class="w-full px-3.5 py-2.5 text-sm bg-slate-50 border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 pr-10">
+          <button type="button" id="btn-toggle-password-visibility" class="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600">
+            <i class="fa-regular fa-eye text-sm"></i>
+          </button>
+        </div>
+
+        <div id="password-error-tip" class="hidden text-xs text-red-500 mb-3 flex items-center space-x-1">
+          <i class="fa-solid fa-circle-exclamation"></i>
+          <span id="password-error-text">密码不正确，请重新输入</span>
+        </div>
+
+        <div class="flex items-center space-x-2">
+          <button type="button" id="btn-cancel-password" class="flex-1 py-2.5 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-xl transition">
+            取消
+          </button>
+          <button type="submit" id="btn-submit-password" class="flex-1 py-2.5 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl shadow-md shadow-blue-500/25 transition">
+            解锁并打开
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- 2. Signature Drawing Modal -->
+  <div id="signature-modal" class="hidden fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4">
+    <div class="bg-white rounded-t-2xl sm:rounded-2xl shadow-2xl max-w-md w-full p-5 border border-slate-200 animate-slide-up sm:animate-scale-up">
+      <div class="flex items-center justify-between mb-3">
+        <div class="flex items-center space-x-2">
+          <i class="fa-solid fa-signature text-blue-600"></i>
+          <h3 class="text-sm font-bold text-slate-900">请在下方空白处书写签名</h3>
+        </div>
+        <button id="btn-close-signature" class="text-slate-400 hover:text-slate-600 w-6 h-6 flex items-center justify-center">
+          <i class="fa-solid fa-xmark text-sm"></i>
+        </button>
+      </div>
+
+      <!-- Signature Board Canvas -->
+      <div class="border-2 border-dashed border-slate-300 rounded-xl overflow-hidden bg-slate-50 relative mb-3">
+        <canvas id="signature-canvas" width="400" height="180" class="w-full touch-none bg-transparent block cursor-crosshair"></canvas>
+        <span class="absolute bottom-2 right-3 text-[10px] text-slate-400 pointer-events-none">透明底背景 · 适合合同盖章与个人签名</span>
+      </div>
+
+      <!-- Signature Color & Stroke Controls -->
+      <div class="flex items-center justify-between mb-4">
+        <div class="flex items-center space-x-2">
+          <span class="text-xs text-slate-500">笔色:</span>
+          <button class="w-6 h-6 rounded-full bg-black border-2 border-blue-500 sig-color-btn" data-color="#000000" title="黑色"></button>
+          <button class="w-6 h-6 rounded-full bg-blue-700 sig-color-btn" data-color="#1d4ed8" title="蓝色"></button>
+          <button class="w-6 h-6 rounded-full bg-red-600 sig-color-btn" data-color="#dc2626" title="红色"></button>
+        </div>
+        <button id="btn-clear-signature" class="text-xs text-slate-500 hover:text-red-500 flex items-center space-x-1 py-1 px-2 rounded-lg hover:bg-slate-100 transition">
+          <i class="fa-solid fa-rotate-right"></i>
+          <span>清空重写</span>
+        </button>
+      </div>
+
+      <!-- Action Buttons -->
+      <div class="flex items-center space-x-2">
+        <button id="btn-cancel-signature" class="flex-1 py-2.5 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-xl transition">
+          取消
+        </button>
+        <button id="btn-confirm-signature" class="flex-1 py-2.5 text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 rounded-xl shadow-md shadow-blue-500/25 transition">
+          完成并插入
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 3. Export / Decrypt Progress Modal -->
+  <div id="export-progress-modal" class="hidden fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
+    <div class="bg-white rounded-2xl shadow-2xl max-w-xs w-full p-6 text-center animate-scale-up">
+      <div class="w-12 h-12 rounded-full border-4 border-blue-200 border-t-blue-600 animate-spin mx-auto mb-4"></div>
+      <h4 class="text-sm font-bold text-slate-900 mb-1">正在处理与导出 PDF</h4>
+      <p id="export-progress-text" class="text-xs text-slate-500 leading-relaxed">正在合成页面修改图层...</p>
+    </div>
+  </div>
+
+  <!-- 4. Global Toast Notification Pill -->
+  <div id="toast-pill" class="fixed top-5 left-1/2 -translate-x-1/2 z-50 bg-slate-900/90 text-white backdrop-blur-md px-4 py-2 rounded-full shadow-lg text-xs font-medium flex items-center space-x-2 transition-all duration-300 opacity-0 pointer-events-none translate-y-[-20px]">
+    <i id="toast-icon" class="fa-solid fa-circle-info text-blue-400"></i>
+    <span id="toast-message">操作已完成</span>
+  </div>
+
+  <!-- Application Logic -->
+  <script src="app.js"></script>
+</body>
+</html>

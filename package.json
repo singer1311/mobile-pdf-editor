@@ -1,0 +1,12 @@
+{
+  "name": "mobile-pdf-editor",
+  "version": "1.0.0",
+  "description": "Pure frontend PDF in-place editor designed for mobile and desktop",
+  "scripts": {
+    "start": "serve . -l 3000",
+    "dev": "serve . -l 3000"
+  },
+  "devDependencies": {
+    "serve": "^14.2.4"
+  }
+}
