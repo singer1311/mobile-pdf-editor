@@ -688,18 +688,26 @@ function setupFabricEventListeners() {
       const calculatedFontSize = Math.max(12, Math.min(Math.round(height * 0.72), 48));
       state.fontSize = calculatedFontSize;
 
+      const initialWidth = Math.max(width + 20, 100);
       const textbox = new fabric.Textbox('点击输入修改文字', {
         left: left,
         top: top + Math.max(0, (height - calculatedFontSize * 1.25) / 2),
-        width: Math.max(width, 100),
+        width: initialWidth,
         fontSize: calculatedFontSize,
         fill: colors.textColor,
         fontFamily: 'system-ui, -apple-system, sans-serif',
         fontWeight: state.isBold ? 'bold' : 'normal',
+        splitByGrapheme: true,
         editable: true,
-        data: { isText: true, linkedMaskId: maskId },
+        data: {
+          isText: true,
+          linkedMaskId: maskId,
+          initialWidth: initialWidth,
+          initialMaskWidth: width,
+        },
       });
 
+      textbox.on('changed', () => updateTextDimensionsAndMask(textbox));
       fabricCanvas.add(textbox);
       fabricCanvas.setActiveObject(textbox);
       textbox.enterEditing();
@@ -728,10 +736,65 @@ function setupFabricEventListeners() {
   fabricCanvas.on('selection:updated', updatePropertyBar);
   fabricCanvas.on('selection:cleared', updatePropertyBar);
 
+  // Auto-expand textbox width and linked mask dynamically as user types!
+  fabricCanvas.on('text:changed', (opt) => {
+    if (opt.target && opt.target.data?.isText) {
+      updateTextDimensionsAndMask(opt.target);
+    }
+  });
+
   // Object modified (for history)
   fabricCanvas.on('object:modified', () => {
     saveCurrentPageState(state.currentPage);
   });
+}
+
+// Automatically expand textbox width and linked background mask as the user types
+function updateTextDimensionsAndMask(obj) {
+  if (!obj || !obj.data?.isText) return;
+
+  // 1. Calculate true text width across all lines
+  const lines = (obj.text || '').split('\n');
+  let maxLineWidth = 0;
+  const ctx = fabricCanvas ? fabricCanvas.getContext() : null;
+
+  if (ctx) {
+    ctx.save();
+    ctx.font = `${obj.fontWeight || 'normal'} ${obj.fontSize || 16}px ${obj.fontFamily || 'sans-serif'}`;
+    for (const l of lines) {
+      const w = ctx.measureText(l).width;
+      if (w > maxLineWidth) maxLineWidth = w;
+    }
+    ctx.restore();
+  } else {
+    maxLineWidth = (obj.getLineWidth ? obj.getLineWidth(0) : obj.width) || 50;
+  }
+
+  // 2. Expand width to fit all typed characters horizontally without being constrained
+  const baseWidth = obj.data.initialWidth || 60;
+  const desiredWidth = Math.max(baseWidth, Math.ceil(maxLineWidth + 28));
+
+  if (desiredWidth > obj.width) {
+    obj.set('width', desiredWidth);
+    if (obj.initDimensions) obj.initDimensions();
+  }
+
+  // 3. Expand linked background mask to cleanly cover newly typed text
+  if (obj.data?.linkedMaskId && fabricCanvas) {
+    const mask = fabricCanvas.getObjects().find(o => o.data?.id === obj.data.linkedMaskId);
+    if (mask) {
+      const origMaskWidth = obj.data.initialMaskWidth || mask.width;
+      const currentWidth = obj.getScaledWidth ? obj.getScaledWidth() : obj.width;
+      const currentHeight = obj.getScaledHeight ? obj.getScaledHeight() : obj.height;
+      mask.set({
+        width: Math.max(origMaskWidth, currentWidth + 6),
+        height: Math.max(mask.height, currentHeight + 2),
+      });
+    }
+  }
+
+  saveCurrentPageState(state.currentPage);
+  if (fabricCanvas) fabricCanvas.requestRenderAll();
 }
 
 // Find the closest interactive textbox to the pointer with generous finger tolerance
@@ -833,15 +896,19 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
   });
   fabricCanvas.add(maskRect);
 
+  const initialWidth = Math.max(line.width + 30, 60);
+  const initialMaskWidth = line.width + 4;
+
   // 3. In-place editable Textbox preserving original font size, color, weight, and font family
   const textbox = new fabric.Textbox(line.text, {
     left: line.left,
     top: line.top,
-    width: Math.max(line.width + 8, 40),
+    width: initialWidth,
     fontSize: line.canvasFontSize,
     fill: colors.textColor,
     fontFamily: line.fontFamily || 'system-ui, -apple-system, sans-serif',
     fontWeight: isBoldFinal ? 'bold' : 'normal',
+    splitByGrapheme: true,
     editable: true,
     hasBorders: true,
     borderColor: '#3b82f6',
@@ -860,9 +927,12 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
       linkedMaskId: maskId,
       originalText: line.text,
       isBoldOriginal: isBoldFinal,
+      initialWidth: initialWidth,
+      initialMaskWidth: initialMaskWidth,
     },
   });
 
+  textbox.on('changed', () => updateTextDimensionsAndMask(textbox));
   fabricCanvas.add(textbox);
 
   if (shouldEditImmediately) {
@@ -870,7 +940,10 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
     setTimeout(() => {
       textbox.enterEditing();
       textbox.selectAll();
-      textbox.hiddenTextarea?.focus();
+      if (textbox.hiddenTextarea) {
+        textbox.hiddenTextarea.style.fontSize = '16px';
+        textbox.hiddenTextarea.focus();
+      }
       fabricCanvas.requestRenderAll();
     }, 50);
     showToast('已进入 Word 修改模式，直接打字替换！', 'info');
