@@ -89,6 +89,19 @@
         <span class="sm:hidden">转Word</span>
       </button>
 
+      <!-- Compare & Preview Button -->
+      <button id="btn-compare-preview" class="hidden px-2.5 sm:px-3 py-1.5 text-xs font-semibold text-purple-700 bg-purple-50 hover:bg-purple-100 active:bg-purple-200 border border-purple-300 rounded-lg flex items-center space-x-1.5 shadow-sm transition" title="与源文件原版对比，查看修改差异并方便快捷下载">
+        <i class="fa-solid fa-code-compare text-purple-600"></i>
+        <span class="hidden sm:inline">对比原件</span>
+        <span class="sm:hidden">对比</span>
+      </button>
+
+      <!-- Revert to Original Button -->
+      <button id="btn-revert-page" class="hidden px-2.5 sm:px-3 py-1.5 text-xs font-medium text-rose-600 bg-rose-50 hover:bg-rose-100 active:bg-rose-200 border border-rose-200 rounded-lg flex items-center space-x-1.5 transition" title="一键撤销本页所有修改，转回原始纯净 PDF">
+        <i class="fa-solid fa-arrow-rotate-left text-rose-500"></i>
+        <span class="hidden sm:inline">转回原样</span>
+      </button>
+
       <!-- Mode Switcher Pill (Browse 🖐️ vs Edit ✏️) -->
       <div id="mode-switch-group" class="hidden items-center bg-slate-200 p-0.5 rounded-lg border border-slate-300">
         <button id="btn-mode-browse" class="px-2 sm:px-2.5 py-1 text-xs font-semibold rounded-md flex items-center space-x-1 transition text-slate-600 hover:text-slate-900" title="浏览/缩放模式：手指拖动平移，双指缩放">
@@ -431,7 +444,91 @@
     </div>
   </div>
 
-  <!-- 4. Global Toast Notification Pill -->
+  <!-- 4. Before & After Comparison & Fast Download Modal -->
+  <div id="compare-modal" class="hidden fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-2 sm:p-4">
+    <div class="bg-white rounded-2xl shadow-2xl max-w-4xl w-full max-h-[92vh] flex flex-col border border-slate-200 overflow-hidden animate-scale-up">
+      <!-- Modal Header -->
+      <div class="px-4 py-3 bg-slate-50 border-b border-slate-200 flex items-center justify-between shrink-0">
+        <div class="flex items-center space-x-2">
+          <div class="w-8 h-8 rounded-lg bg-purple-100 text-purple-600 flex items-center justify-center text-sm">
+            <i class="fa-solid fa-code-compare"></i>
+          </div>
+          <div>
+            <h3 class="text-sm font-bold text-slate-900">与源文件对比 & 导出预览</h3>
+            <p class="text-[11px] text-slate-500">第 <span id="compare-page-num">1</span> 页 · 左右并排比对修改差异，确认无误可一键保存</p>
+          </div>
+        </div>
+        <button id="btn-close-compare-modal" class="w-8 h-8 rounded-full flex items-center justify-center text-slate-400 hover:text-slate-600 hover:bg-slate-200 transition">
+          <i class="fa-solid fa-xmark text-base"></i>
+        </button>
+      </div>
+
+      <!-- Mobile Tab Switcher (Visible on Mobile) -->
+      <div class="md:hidden flex items-center justify-center p-2 bg-slate-100 border-b border-slate-200 shrink-0">
+        <div class="inline-flex rounded-lg bg-slate-200 p-0.5 text-xs font-semibold">
+          <button id="tab-compare-modified" class="px-3 py-1.5 rounded-md bg-white text-blue-600 shadow-sm transition">
+            <i class="fa-solid fa-pen-to-square mr-1"></i>修改后效果
+          </button>
+          <button id="tab-compare-original" class="px-3 py-1.5 rounded-md text-slate-600 hover:text-slate-900 transition">
+            <i class="fa-solid fa-file-lines mr-1"></i>源文件原版
+          </button>
+        </div>
+      </div>
+
+      <!-- Comparison Previews Body -->
+      <div class="flex-1 overflow-auto p-3 sm:p-5 bg-slate-100/70">
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 h-full">
+          <!-- Left: Original PDF Preview -->
+          <div id="compare-original-container" class="flex flex-col bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+            <div class="px-3 py-2 bg-slate-50 border-b border-slate-200 text-xs font-bold text-slate-600 flex items-center justify-between">
+              <span class="flex items-center space-x-1.5">
+                <span class="w-2 h-2 rounded-full bg-slate-400"></span>
+                <span>源文件原版 (Original)</span>
+              </span>
+              <span class="text-[10px] text-slate-400 font-normal">未修改原样</span>
+            </div>
+            <div class="flex-1 overflow-auto p-2 flex items-center justify-center bg-slate-50/50 min-h-[260px]">
+              <img id="compare-original-img" class="max-w-full max-h-[58vh] object-contain shadow-sm rounded border border-slate-200" alt="源文件原件">
+            </div>
+          </div>
+
+          <!-- Right: Modified Result Preview -->
+          <div id="compare-modified-container" class="flex flex-col bg-white rounded-xl border border-blue-200 shadow-sm overflow-hidden">
+            <div class="px-3 py-2 bg-blue-50/70 border-b border-blue-100 text-xs font-bold text-blue-700 flex items-center justify-between">
+              <span class="flex items-center space-x-1.5">
+                <span class="w-2 h-2 rounded-full bg-blue-600"></span>
+                <span>当前修改后效果 (Modified)</span>
+              </span>
+              <span class="text-[10px] bg-blue-100 text-blue-700 px-1.5 py-0.5 rounded font-medium">包含文字/遮罩</span>
+            </div>
+            <div class="flex-1 overflow-auto p-2 flex items-center justify-center bg-slate-50/50 min-h-[260px]">
+              <img id="compare-modified-img" class="max-w-full max-h-[58vh] object-contain shadow-sm rounded border border-slate-200" alt="修改后效果">
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Modal Footer Action Bar -->
+      <div class="px-4 py-3 bg-white border-t border-slate-200 flex flex-wrap items-center justify-between gap-2 shrink-0">
+        <button id="btn-revert-current-page" class="px-3 py-2 text-xs font-semibold text-rose-600 bg-rose-50 hover:bg-rose-100 active:bg-rose-200 border border-rose-200 rounded-xl transition flex items-center space-x-1.5">
+          <i class="fa-solid fa-arrow-rotate-left"></i>
+          <span>一键恢复原件（转回原样）</span>
+        </button>
+
+        <div class="flex items-center space-x-2">
+          <button id="btn-cancel-compare" class="px-4 py-2 text-xs font-medium text-slate-600 hover:bg-slate-100 rounded-xl transition">
+            返回编辑
+          </button>
+          <button id="btn-fast-download-pdf" class="px-5 py-2 text-xs font-bold text-white bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 active:scale-95 shadow-md shadow-blue-500/25 rounded-xl transition flex items-center space-x-2">
+            <i class="fa-solid fa-download"></i>
+            <span>立即下载修改后 PDF</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 5. Global Toast Notification Pill -->
   <div id="toast-pill" class="fixed top-5 left-1/2 -translate-x-1/2 z-50 bg-slate-900/90 text-white backdrop-blur-md px-4 py-2 rounded-full shadow-lg text-xs font-medium flex items-center space-x-2 transition-all duration-300 opacity-0 pointer-events-none translate-y-[-20px]">
     <i id="toast-icon" class="fa-solid fa-circle-info text-blue-400"></i>
     <span id="toast-message">操作已完成</span>

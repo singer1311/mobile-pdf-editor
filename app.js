@@ -76,6 +76,8 @@ const elements = {
   btnNextPage: document.getElementById('btn-next-page'),
   btnOpenPdf: document.getElementById('btn-open-pdf'),
   btnConvertAllText: document.getElementById('btn-convert-all-text'),
+  btnComparePreview: document.getElementById('btn-compare-preview'),
+  btnRevertPage: document.getElementById('btn-revert-page'),
   smartEditTipBanner: document.getElementById('smart-edit-tip-banner'),
   btnCloseTipBanner: document.getElementById('btn-close-tip-banner'),
   pdfFileInput: document.getElementById('pdf-file-input'),
@@ -137,6 +139,20 @@ const elements = {
 
   exportProgressModal: document.getElementById('export-progress-modal'),
   exportProgressText: document.getElementById('export-progress-text'),
+
+  // Compare & Fast Download Modal
+  compareModal: document.getElementById('compare-modal'),
+  comparePageNum: document.getElementById('compare-page-num'),
+  btnCloseCompareModal: document.getElementById('btn-close-compare-modal'),
+  tabCompareModified: document.getElementById('tab-compare-modified'),
+  tabCompareOriginal: document.getElementById('tab-compare-original'),
+  compareOriginalContainer: document.getElementById('compare-original-container'),
+  compareModifiedContainer: document.getElementById('compare-modified-container'),
+  compareOriginalImg: document.getElementById('compare-original-img'),
+  compareModifiedImg: document.getElementById('compare-modified-img'),
+  btnRevertCurrentPage: document.getElementById('btn-revert-current-page'),
+  btnCancelCompare: document.getElementById('btn-cancel-compare'),
+  btnFastDownloadPdf: document.getElementById('btn-fast-download-pdf'),
 
   toastPill: document.getElementById('toast-pill'),
   toastIcon: document.getElementById('toast-icon'),
@@ -227,6 +243,14 @@ async function openPdfFile(arrayBuffer, fileName = 'document.pdf', password = ''
     if (elements.btnConvertAllText) {
       elements.btnConvertAllText.classList.remove('hidden');
       elements.btnConvertAllText.classList.add('flex');
+    }
+    if (elements.btnComparePreview) {
+      elements.btnComparePreview.classList.remove('hidden');
+      elements.btnComparePreview.classList.add('flex');
+    }
+    if (elements.btnRevertPage) {
+      elements.btnRevertPage.classList.remove('hidden');
+      elements.btnRevertPage.classList.add('flex');
     }
     if (elements.smartEditTipBanner) {
       elements.smartEditTipBanner.classList.remove('hidden');
@@ -1022,13 +1046,16 @@ async function extractPageTextLines(page, viewport) {
         continue;
       }
 
-      const sameBaseline = Math.abs(currentLine.vy - item.vy) <= Math.max(6, item.canvasFontSize * 0.45);
+      const sameBaseline = Math.abs(currentLine.vy - item.vy) <= Math.max(5, item.canvasFontSize * 0.35);
       const xGap = item.left - (currentLine.left + currentLine.width);
       const sameWeight = (currentLine.isBold === item.isBold);
+      const fontDiff = Math.abs(currentLine.canvasFontSize - item.canvasFontSize);
+      const sameFontSize = (fontDiff <= 2.5);
+      const isWordAdjacent = (xGap >= -8 && xGap <= Math.min(20, item.canvasFontSize * 1.25));
 
-      // Only merge if on the same baseline, reasonably close, AND sharing the same bold style!
-      // This preserves bold dates, numbers, and bold terms (like "Nov 15, 2023.") without collapsing!
-      if (sameBaseline && sameWeight && xGap < item.canvasFontSize * 3.0 && xGap > -25) {
+      // Only merge if on the same baseline, reasonably close, SAME font size, and sharing the same bold style!
+      // This strictly prevents merging across table columns (like '11/15/23' and '$82.71')!
+      if (sameBaseline && sameWeight && sameFontSize && isWordAdjacent) {
         const addSpace = (xGap > 1 && !currentLine.text.endsWith(' ') && !item.str.startsWith(' ')) ? ' ' : '';
         currentLine.text += addSpace + item.str;
         currentLine.width = (item.left + item.width) - currentLine.left;
@@ -1098,6 +1125,10 @@ function samplePdfColors(left, top, width, height) {
         g: Math.round(bgG / bgCount),
         b: Math.round(bgB / bgCount),
       };
+      // Snap near-white document paper to pure white
+      if (bg.r > 235 && bg.g > 235 && bg.b > 235) {
+        bg = { r: 255, g: 255, b: 255 };
+      }
     }
 
     // 2. Interior contrast sampling for text color
@@ -1123,9 +1154,15 @@ function samplePdfColors(left, top, width, height) {
         g: Math.round(textG / textCount),
         b: Math.round(textB / textCount),
       };
-    } else {
-      const bgBrightness = (bg.r * 299 + bg.g * 587 + bg.b * 114) / 1000;
-      text = bgBrightness > 128 ? { r: 17, g: 24, b: 39 } : { r: 255, g: 255, b: 255 };
+    }
+
+    // Verify text contrast against background to prevent washed-out / light-on-light text
+    const bgBrightness = (bg.r * 299 + bg.g * 587 + bg.b * 114) / 1000;
+    const textBrightness = (text.r * 299 + text.g * 587 + text.b * 114) / 1000;
+    if (bgBrightness > 150 && textBrightness > 110) {
+      text = { r: 17, g: 24, b: 39 }; // Force dark ink on light background
+    } else if (bgBrightness <= 150 && textBrightness < 140) {
+      text = { r: 255, g: 255, b: 255 }; // Force white ink on dark background
     }
 
     const toHex = (c) => `#${((1 << 24) + (c.r << 16) + (c.g << 8) + c.b).toString(16).slice(1)}`;
@@ -1592,7 +1629,110 @@ function showExportProgress(show, text = '') {
 }
 
 // ==========================================
-// 12. Setup UI Event Listeners
+// 12. Before & After Comparison & Revert
+// ==========================================
+async function openCompareModal() {
+  if (!state.pdfDoc) {
+    showToast('请先打开 PDF 文件', 'error');
+    return;
+  }
+
+  showToast('正在生成对比预览...', 'info');
+
+  try {
+    saveCurrentPageState(state.currentPage);
+    elements.comparePageNum.textContent = state.currentPage;
+
+    // 1. Render pristine original PDF page without any Fabric modifications
+    const page = await state.pdfDoc.getPage(state.currentPage);
+    const viewport = page.getViewport({ scale: 1.5 });
+    const origCanvas = document.createElement('canvas');
+    origCanvas.width = viewport.width;
+    origCanvas.height = viewport.height;
+    const origCtx = origCanvas.getContext('2d');
+    await page.render({ canvasContext: origCtx, viewport }).promise;
+    elements.compareOriginalImg.src = origCanvas.toDataURL('image/png');
+
+    // 2. Render modified composite page (original PDF + Fabric modifications)
+    const compCanvas = document.createElement('canvas');
+    compCanvas.width = viewport.width;
+    compCanvas.height = viewport.height;
+    const compCtx = compCanvas.getContext('2d');
+    compCtx.drawImage(origCanvas, 0, 0);
+
+    if (fabricCanvas) {
+      const fabricDataUrl = fabricCanvas.toDataURL({
+        format: 'png',
+        multiplier: 1.0 / state.currentZoom,
+      });
+      await new Promise((resolve) => {
+        const overlayImg = new Image();
+        overlayImg.onload = () => {
+          compCtx.drawImage(overlayImg, 0, 0, viewport.width, viewport.height);
+          resolve();
+        };
+        overlayImg.src = fabricDataUrl;
+      });
+    }
+    elements.compareModifiedImg.src = compCanvas.toDataURL('image/png');
+
+    // 3. Show modal & handle responsive visibility
+    elements.compareModal.classList.remove('hidden');
+
+    if (window.innerWidth >= 768) {
+      elements.compareModifiedContainer.classList.remove('hidden');
+      elements.compareOriginalContainer.classList.remove('hidden');
+    } else {
+      switchCompareTab('modified');
+    }
+  } catch (err) {
+    console.error('Error generating comparison:', err);
+    showToast('生成对比失败: ' + err.message, 'error');
+  }
+}
+
+function closeCompareModal() {
+  elements.compareModal.classList.add('hidden');
+}
+
+function switchCompareTab(tab) {
+  if (window.innerWidth >= 768) {
+    elements.compareModifiedContainer.classList.remove('hidden');
+    elements.compareOriginalContainer.classList.remove('hidden');
+    return;
+  }
+  if (tab === 'modified') {
+    elements.tabCompareModified.className = 'px-3 py-1.5 rounded-md bg-white text-blue-600 shadow-sm transition';
+    elements.tabCompareOriginal.className = 'px-3 py-1.5 rounded-md text-slate-600 hover:text-slate-900 transition';
+    elements.compareModifiedContainer.classList.remove('hidden');
+    elements.compareOriginalContainer.classList.add('hidden');
+  } else {
+    elements.tabCompareOriginal.className = 'px-3 py-1.5 rounded-md bg-white text-blue-600 shadow-sm transition';
+    elements.tabCompareModified.className = 'px-3 py-1.5 rounded-md text-slate-600 hover:text-slate-900 transition';
+    elements.compareOriginalContainer.classList.remove('hidden');
+    elements.compareModifiedContainer.classList.add('hidden');
+  }
+}
+
+// Revert current page to pure untouched original PDF
+function revertCurrentPage() {
+  const confirmed = confirm('确定要将当前页一键还原回原始 PDF 吗？\n当前页的所有修改（文字替换、遮罩、批注）都将被撤销并恢复原样。');
+  if (!confirmed) return;
+
+  if (fabricCanvas) {
+    fabricCanvas.clear();
+  }
+  delete state.pageStates[state.currentPage];
+  delete state.historyStack[state.currentPage];
+
+  closeCompareModal();
+  saveCurrentPageState(state.currentPage);
+  fabricCanvas.requestRenderAll();
+  showToast('当前页已一键转回原始 PDF 原貌！', 'success');
+}
+
+// ==========================================
+// 13. Setup UI Event Listeners
 // ==========================================
 function setupEventListeners() {
   // File Upload Handlers
@@ -1670,6 +1810,12 @@ function setupEventListeners() {
   if (elements.btnConvertAllText) {
     elements.btnConvertAllText.addEventListener('click', convertAllTextToEditable);
   }
+  if (elements.btnComparePreview) {
+    elements.btnComparePreview.addEventListener('click', openCompareModal);
+  }
+  if (elements.btnRevertPage) {
+    elements.btnRevertPage.addEventListener('click', revertCurrentPage);
+  }
   if (elements.toolConvertPage) {
     elements.toolConvertPage.addEventListener('click', convertAllTextToEditable);
   }
@@ -1679,6 +1825,29 @@ function setupEventListeners() {
   if (elements.btnCloseTipBanner) {
     elements.btnCloseTipBanner.addEventListener('click', () => {
       elements.smartEditTipBanner.classList.add('hidden');
+    });
+  }
+
+  // Compare & Fast Download Modal Listeners
+  if (elements.btnCloseCompareModal) {
+    elements.btnCloseCompareModal.addEventListener('click', closeCompareModal);
+  }
+  if (elements.btnCancelCompare) {
+    elements.btnCancelCompare.addEventListener('click', closeCompareModal);
+  }
+  if (elements.tabCompareModified) {
+    elements.tabCompareModified.addEventListener('click', () => switchCompareTab('modified'));
+  }
+  if (elements.tabCompareOriginal) {
+    elements.tabCompareOriginal.addEventListener('click', () => switchCompareTab('original'));
+  }
+  if (elements.btnRevertCurrentPage) {
+    elements.btnRevertCurrentPage.addEventListener('click', revertCurrentPage);
+  }
+  if (elements.btnFastDownloadPdf) {
+    elements.btnFastDownloadPdf.addEventListener('click', () => {
+      closeCompareModal();
+      exportModifiedPdf();
     });
   }
 
@@ -1869,6 +2038,13 @@ function setupEventListeners() {
     }
   });
 }
+
+// Expose functions for debugging & tests
+window.openPdfFile = openPdfFile;
+window.openCompareModal = openCompareModal;
+window.revertCurrentPage = revertCurrentPage;
+window.exportModifiedPdf = exportModifiedPdf;
+window.convertAllTextToEditable = convertAllTextToEditable;
 
 // Initialize Application
 function initApp() {
