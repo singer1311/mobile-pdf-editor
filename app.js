@@ -76,6 +76,9 @@ const elements = {
   btnNextPage: document.getElementById('btn-next-page'),
   btnOpenPdf: document.getElementById('btn-open-pdf'),
   btnConvertAllText: document.getElementById('btn-convert-all-text'),
+  btnBatchReplace: document.getElementById('btn-batch-replace'),
+  toolBatchReplace: document.getElementById('tool-batch-replace'),
+  btnReplaceThisText: document.getElementById('btn-replace-this-text'),
   btnComparePreview: document.getElementById('btn-compare-preview'),
   btnRevertPage: document.getElementById('btn-revert-page'),
   smartEditTipBanner: document.getElementById('smart-edit-tip-banner'),
@@ -154,6 +157,25 @@ const elements = {
   btnCancelCompare: document.getElementById('btn-cancel-compare'),
   btnFastDownloadPdf: document.getElementById('btn-fast-download-pdf'),
 
+  // Batch Replace Modal
+  modalBatchReplace: document.getElementById('modal-batch-replace'),
+  btnCloseReplaceModal: document.getElementById('btn-close-replace-modal'),
+  btnCancelReplace: document.getElementById('btn-cancel-replace'),
+  btnExecuteReplace: document.getElementById('btn-execute-replace'),
+  inputReplaceFind: document.getElementById('input-replace-find'),
+  inputReplaceTarget: document.getElementById('input-replace-target'),
+  replaceMatchCountBadge: document.getElementById('replace-match-count-badge'),
+  replacePreviewContainer: document.getElementById('replace-preview-container'),
+  replacePreviewList: document.getElementById('replace-preview-list'),
+  chkReplaceExact: document.getElementById('chk-replace-exact'),
+  btnClearReplaceFind: document.getElementById('btn-clear-replace-find'),
+
+  // Draft Recovery Banner
+  draftRecoveryBanner: document.getElementById('draft-recovery-banner'),
+  draftRecoveryText: document.getElementById('draft-recovery-text'),
+  btnRestoreDraft: document.getElementById('btn-restore-draft'),
+  btnDiscardDraft: document.getElementById('btn-discard-draft'),
+
   toastPill: document.getElementById('toast-pill'),
   toastIcon: document.getElementById('toast-icon'),
   toastMessage: document.getElementById('toast-message'),
@@ -202,7 +224,7 @@ function showToast(message, type = 'info') {
 // ==========================================
 // 2. PDF Loading & Password Handling
 // ==========================================
-async function openPdfFile(arrayBuffer, fileName = 'document.pdf', password = '') {
+async function openPdfFile(arrayBuffer, fileName = 'document.pdf', password = '', initialPageStates = null) {
   // Clone ArrayBuffer to avoid detachment by PDF.js worker transfer
   state.pdfData = arrayBuffer.slice(0);
   state.fileName = fileName;
@@ -230,7 +252,7 @@ async function openPdfFile(arrayBuffer, fileName = 'document.pdf', password = ''
     state.pdfDoc = await loadingTask.promise;
     state.totalPages = state.pdfDoc.numPages;
     state.currentPage = 1;
-    state.pageStates = {}; // Clear previous page edits
+    state.pageStates = initialPageStates ? JSON.parse(JSON.stringify(initialPageStates)) : {}; // Restore draft edits if present
     state.historyStack = {};
 
     hidePasswordModal();
@@ -243,6 +265,10 @@ async function openPdfFile(arrayBuffer, fileName = 'document.pdf', password = ''
     if (elements.btnConvertAllText) {
       elements.btnConvertAllText.classList.remove('hidden');
       elements.btnConvertAllText.classList.add('flex');
+    }
+    if (elements.btnBatchReplace) {
+      elements.btnBatchReplace.classList.remove('hidden');
+      elements.btnBatchReplace.classList.add('flex');
     }
     if (elements.btnComparePreview) {
       elements.btnComparePreview.classList.remove('hidden');
@@ -399,7 +425,9 @@ async function renderPage(pageNum) {
 
 function saveCurrentPageState(pageNum) {
   if (!fabricCanvas) return;
-  state.pageStates[pageNum] = fabricCanvas.toJSON(['data', 'isMask', 'isText']);
+  const p = pageNum || state.currentPage;
+  state.pageStates[p] = fabricCanvas.toJSON(['data', 'isMask', 'isText']);
+  saveDraftToStorage();
 }
 
 function updatePaginationUI() {
@@ -783,6 +811,17 @@ function updateTextDimensionsAndMask(obj) {
   if (obj.data?.linkedMaskId && fabricCanvas) {
     const mask = fabricCanvas.getObjects().find(o => o.data?.id === obj.data.linkedMaskId);
     if (mask) {
+      // Self-heal: If mask was inadvertently colored (e.g. blue) on light document paper, snap it to pure white!
+      if (mask.fill && mask.fill.toLowerCase() !== '#ffffff') {
+        const colors = samplePdfColors(obj.left, obj.top, obj.width, obj.height);
+        if (colors.bgColor === '#ffffff') {
+          mask.set('fill', '#ffffff');
+          if (obj.fill === '#ffffff') {
+            obj.set('fill', '#111827');
+          }
+        }
+      }
+
       const origMaskWidth = obj.data.initialMaskWidth || mask.width;
       const currentWidth = obj.getScaledWidth ? obj.getScaledWidth() : obj.width;
       const currentHeight = obj.getScaledHeight ? obj.getScaledHeight() : obj.height;
@@ -906,12 +945,13 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
     width: initialWidth,
     fontSize: line.canvasFontSize,
     fill: colors.textColor,
+    backgroundColor: 'transparent',
     fontFamily: line.fontFamily || 'system-ui, -apple-system, sans-serif',
     fontWeight: isBoldFinal ? 'bold' : 'normal',
     splitByGrapheme: true,
     editable: true,
     hasBorders: true,
-    borderColor: '#3b82f6',
+    borderColor: '#93c5fd',
     borderDashArray: [3, 3],
     borderScaleFactor: 1.0,
     padding: 0,            // 0 padding so vertical bounds do not collide with neighboring lines
@@ -1152,7 +1192,7 @@ async function extractPageTextLines(page, viewport) {
   }
 }
 
-// Smart dual-sampling: samples both perimeter background color and text contrast color
+// Smart interior mode sampling: immune to borders, lines, and adjacent elements
 function samplePdfColors(left, top, width, height) {
   try {
     const pdfCanvas = elements.pdfCanvas;
@@ -1166,53 +1206,70 @@ function samplePdfColors(left, top, width, height) {
 
     if (w <= 0 || h <= 0) return { bgColor: '#ffffff', textColor: '#111827' };
 
-    // 1. Perimeter sampling for true background color (points slightly outside bounding box)
-    const perimeterPoints = [
-      { x: l - 3, y: t - 3 },
-      { x: l + Math.floor(w / 2), y: t - 3 },
-      { x: l + w + 3, y: t - 3 },
-      { x: l - 3, y: t + Math.floor(h / 2) },
-      { x: l + w + 3, y: t + Math.floor(h / 2) },
-      { x: l - 3, y: t + h + 3 },
-      { x: l + Math.floor(w / 2), y: t + h + 3 },
-      { x: l + w + 3, y: t + h + 3 },
-    ];
+    // 1. Interior mode sampling: characters take ~15-25% of area; background is the dominant mode (众数)
+    // Never jump outside the box to prevent grabbing blue borders, table lines, or colored frames!
+    const imgData = ctx.getImageData(l, t, w, h).data;
+    const colorHistogram = new Map();
+    let totalSamples = 0;
+    let whitePixelCount = 0;
 
-    let bgR = 0, bgG = 0, bgB = 0, bgCount = 0;
-    for (const p of perimeterPoints) {
-      const px = Math.min(pdfCanvas.width - 1, Math.max(0, p.x));
-      const py = Math.min(pdfCanvas.height - 1, Math.max(0, p.y));
-      const pixel = ctx.getImageData(px, py, 1, 1).data;
-      if (pixel[3] > 80) {
-        bgR += pixel[0];
-        bgG += pixel[1];
-        bgB += pixel[2];
-        bgCount++;
+    const stride = 12; // 3 pixels * 4 bytes for fast, representative sampling
+    for (let i = 0; i < imgData.length; i += stride) {
+      const r = imgData[i];
+      const g = imgData[i + 1];
+      const b = imgData[i + 2];
+      const a = imgData[i + 3];
+      if (a < 80) continue;
+
+      totalSamples++;
+      if (r > 215 && g > 215 && b > 215) {
+        whitePixelCount++;
       }
+
+      // 16-level buckets to group anti-aliased variations
+      const qr = Math.round(r / 16) * 16;
+      const qg = Math.round(g / 16) * 16;
+      const qb = Math.round(b / 16) * 16;
+      const key = `${qr},${qg},${qb}`;
+
+      colorHistogram.set(key, (colorHistogram.get(key) || 0) + 1);
     }
 
+    // If 30%+ of interior pixels are white/near-white, the background is undeniably white paper
     let bg = { r: 255, g: 255, b: 255 };
-    if (bgCount > 0) {
-      bg = {
-        r: Math.round(bgR / bgCount),
-        g: Math.round(bgG / bgCount),
-        b: Math.round(bgB / bgCount),
-      };
+    if (totalSamples > 0 && (whitePixelCount / totalSamples) >= 0.30) {
+      bg = { r: 255, g: 255, b: 255 };
+    } else if (colorHistogram.size > 0) {
+      // Find mode bucket
+      let maxCount = 0;
+      let dominantKey = '255,255,255';
+      for (const [key, count] of colorHistogram.entries()) {
+        if (count > maxCount) {
+          maxCount = count;
+          dominantKey = key;
+        }
+      }
+      const [dr, dg, db] = dominantKey.split(',').map(Number);
+      bg = { r: dr, g: dg, b: db };
+
       // Snap near-white document paper to pure white
-      if (bg.r > 235 && bg.g > 235 && bg.b > 235) {
+      const bgLum = (bg.r * 299 + bg.g * 587 + bg.b * 114) / 1000;
+      if (bgLum > 195 || (bg.r > 210 && bg.g > 210 && bg.b > 210)) {
         bg = { r: 255, g: 255, b: 255 };
       }
     }
 
-    // 2. Interior contrast sampling for text color
-    const imgData = ctx.getImageData(l, t, w, h).data;
+    // 2. Interior contrast sampling for text ink color
     let textR = 0, textG = 0, textB = 0, textCount = 0;
+    for (let i = 0; i < imgData.length; i += stride) {
+      const r = imgData[i];
+      const g = imgData[i + 1];
+      const b = imgData[i + 2];
+      const a = imgData[i + 3];
+      if (a < 80) continue;
 
-    for (let i = 0; i < imgData.length; i += 16) { // step by 4 pixels (16 bytes)
-      const r = imgData[i], g = imgData[i + 1], b = imgData[i + 2], a = imgData[i + 3];
-      if (a < 100) continue;
       const dist = Math.abs(r - bg.r) + Math.abs(g - bg.g) + Math.abs(b - bg.b);
-      if (dist > 38) { // Distinct contrast from background
+      if (dist > 45) { // Distinct contrast from background
         textR += r;
         textG += g;
         textB += b;
@@ -1220,7 +1277,7 @@ function samplePdfColors(left, top, width, height) {
       }
     }
 
-    let text = { r: 17, g: 24, b: 39 };
+    let text = { r: 17, g: 24, b: 39 }; // Default dark charcoal
     if (textCount > 0) {
       text = {
         r: Math.round(textR / textCount),
@@ -1229,12 +1286,12 @@ function samplePdfColors(left, top, width, height) {
       };
     }
 
-    // Verify text contrast against background to prevent washed-out / light-on-light text
+    // Verify text contrast against background
     const bgBrightness = (bg.r * 299 + bg.g * 587 + bg.b * 114) / 1000;
     const textBrightness = (text.r * 299 + text.g * 587 + text.b * 114) / 1000;
-    if (bgBrightness > 150 && textBrightness > 110) {
+    if (bgBrightness > 140 && textBrightness > 100) {
       text = { r: 17, g: 24, b: 39 }; // Force dark ink on light background
-    } else if (bgBrightness <= 150 && textBrightness < 140) {
+    } else if (bgBrightness <= 140 && textBrightness < 140) {
       text = { r: 255, g: 255, b: 255 }; // Force white ink on dark background
     }
 
@@ -2110,6 +2167,464 @@ function setupEventListeners() {
       fitToScreenWidth();
     }
   });
+
+  // Batch Find & Replace Event Listeners
+  elements.btnBatchReplace?.addEventListener('click', () => openBatchReplaceModal());
+  elements.toolBatchReplace?.addEventListener('click', () => openBatchReplaceModal());
+  elements.btnReplaceThisText?.addEventListener('click', () => {
+    const act = fabricCanvas?.getActiveObject();
+    openBatchReplaceModal(act?.text?.trim());
+  });
+  elements.btnCloseReplaceModal?.addEventListener('click', closeBatchReplaceModal);
+  elements.btnCancelReplace?.addEventListener('click', closeBatchReplaceModal);
+  elements.btnExecuteReplace?.addEventListener('click', executeBatchReplace);
+  elements.inputReplaceFind?.addEventListener('input', updateReplacePreview);
+  elements.chkReplaceExact?.addEventListener('change', updateReplacePreview);
+  document.querySelectorAll('input[name="replace-scope"]').forEach(r => r.addEventListener('change', updateReplacePreview));
+  elements.btnClearReplaceFind?.addEventListener('click', () => {
+    elements.inputReplaceFind.value = '';
+    updateReplacePreview();
+    elements.inputReplaceFind.focus();
+  });
+
+  // Shortcut Ctrl+H / Cmd+H for batch replace
+  window.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'h' || e.key === 'H')) {
+      e.preventDefault();
+      openBatchReplaceModal();
+    }
+  });
+
+  // Prevent accidental loss of unsaved changes
+  window.addEventListener('beforeunload', (e) => {
+    const hasEdits = Object.values(state.pageStates).some(st => st?.objects?.length > 0) ||
+                     (fabricCanvas && fabricCanvas.getObjects().length > 0);
+    if (hasEdits) {
+      saveDraftToStorage();
+      e.preventDefault();
+      e.returnValue = '您有未保存的修改，确定要离开吗？系统已在本地为您暂存草稿。';
+      return e.returnValue;
+    }
+  });
+}
+
+// ==========================================
+// 14. Batch Find & Replace Logic (一键批量查找替换)
+// ==========================================
+function openBatchReplaceModal(prefillFind = null) {
+  if (!state.pdfDoc) {
+    showToast('请先打开 PDF 文件', 'error');
+    return;
+  }
+
+  let initialFind = prefillFind;
+  if (!initialFind && fabricCanvas) {
+    const activeObj = fabricCanvas.getActiveObject();
+    if (activeObj && activeObj.data?.isText && activeObj.text) {
+      initialFind = activeObj.text.trim();
+    }
+  }
+
+  if (initialFind) {
+    elements.inputReplaceFind.value = initialFind;
+    elements.btnClearReplaceFind.classList.remove('hidden');
+  } else {
+    elements.btnClearReplaceFind.classList.add('hidden');
+  }
+
+  elements.modalBatchReplace.classList.remove('hidden');
+  updateReplacePreview();
+
+  setTimeout(() => {
+    if (initialFind) {
+      elements.inputReplaceTarget.focus();
+    } else {
+      elements.inputReplaceFind.focus();
+    }
+  }, 50);
+}
+
+function closeBatchReplaceModal() {
+  elements.modalBatchReplace.classList.add('hidden');
+}
+
+// Compute live matching preview
+async function updateReplacePreview() {
+  const findStr = (elements.inputReplaceFind.value || '').trim();
+  const scope = document.querySelector('input[name="replace-scope"]:checked')?.value || 'current';
+  const exact = elements.chkReplaceExact.checked;
+
+  if (!findStr) {
+    elements.replaceMatchCountBadge.textContent = '请输入查找内容';
+    elements.replaceMatchCountBadge.className = 'text-[11px] font-medium text-slate-400';
+    elements.btnExecuteReplace.disabled = true;
+    elements.replacePreviewContainer.classList.add('hidden');
+    elements.btnClearReplaceFind.classList.add('hidden');
+    return;
+  }
+
+  elements.btnClearReplaceFind.classList.remove('hidden');
+
+  let matchCount = 0;
+  const previewItems = [];
+
+  const pagesToScan = (scope === 'all') 
+    ? Array.from({ length: state.totalPages }, (_, i) => i + 1)
+    : [state.currentPage];
+
+  for (const p of pagesToScan) {
+    // 1. Check existing fabric textboxes on current page
+    if (p === state.currentPage && fabricCanvas) {
+      const activeObjs = fabricCanvas.getObjects();
+      for (const obj of activeObjs) {
+        if (obj.data?.isText && obj.text) {
+          const matched = exact ? (obj.text.trim() === findStr) : obj.text.includes(findStr);
+          if (matched) {
+            matchCount++;
+            if (previewItems.length < 5) {
+              previewItems.push(`第 ${p} 页 (已编辑): "${obj.text.substring(0, 30)}"`);
+            }
+          }
+        }
+      }
+    } else if (state.pageStates[p]?.objects) {
+      for (const obj of state.pageStates[p].objects) {
+        if (obj.data?.isText && obj.text) {
+          const matched = exact ? (obj.text.trim() === findStr) : obj.text.includes(findStr);
+          if (matched) {
+            matchCount++;
+            if (previewItems.length < 5) {
+              previewItems.push(`第 ${p} 页 (已编辑): "${obj.text.substring(0, 30)}"`);
+            }
+          }
+        }
+      }
+    }
+
+    // 2. Check unconverted text lines in pageTextLines
+    const lines = state.pageTextLines[p] || [];
+    const convertedLineIds = new Set();
+    if (p === state.currentPage && fabricCanvas) {
+      fabricCanvas.getObjects().forEach(o => {
+        if (o.data?.lineId) convertedLineIds.add(o.data.lineId);
+      });
+    } else if (state.pageStates[p]?.objects) {
+      state.pageStates[p].objects.forEach(o => {
+        if (o.data?.lineId) convertedLineIds.add(o.data.lineId);
+      });
+    }
+
+    for (const l of lines) {
+      if (convertedLineIds.has(l.id)) continue;
+      const matched = exact ? (l.text.trim() === findStr) : l.text.includes(findStr);
+      if (matched) {
+        matchCount++;
+        if (previewItems.length < 5) {
+          previewItems.push(`第 ${p} 页: "${l.text.substring(0, 30)}"`);
+        }
+      }
+    }
+  }
+
+  if (matchCount > 0) {
+    elements.replaceMatchCountBadge.textContent = `找到 ${matchCount} 处匹配项`;
+    elements.replaceMatchCountBadge.className = 'text-[11px] font-bold text-emerald-600';
+    elements.btnExecuteReplace.disabled = false;
+    elements.replacePreviewContainer.classList.remove('hidden');
+    elements.replacePreviewList.innerHTML = previewItems
+      .map(item => `<div class="truncate text-slate-700 py-0.5"><i class="fa-solid fa-check text-emerald-500 mr-1 text-[10px]"></i>${item}</div>`)
+      .join('');
+  } else {
+    elements.replaceMatchCountBadge.textContent = '未找到匹配项';
+    elements.replaceMatchCountBadge.className = 'text-[11px] font-medium text-rose-500';
+    elements.btnExecuteReplace.disabled = true;
+    elements.replacePreviewContainer.classList.add('hidden');
+  }
+}
+
+// Execute Batch Replacement across current or all pages
+async function executeBatchReplace() {
+  const findStr = (elements.inputReplaceFind.value || '').trim();
+  const replaceStr = elements.inputReplaceTarget.value || '';
+  const scope = document.querySelector('input[name="replace-scope"]:checked')?.value || 'current';
+  const exact = elements.chkReplaceExact.checked;
+
+  if (!findStr) {
+    showToast('请输入要查找的内容', 'error');
+    return;
+  }
+
+  closeBatchReplaceModal();
+  showToast(`正在批量替换: "${findStr}" ➔ "${replaceStr}"...`, 'info');
+
+  let totalReplaced = 0;
+
+  try {
+    // 1. Current Page Processing
+    if (fabricCanvas) {
+      const activeObjs = fabricCanvas.getObjects();
+      const convertedLineIds = new Set();
+
+      // Step A: Replace inside active Fabric Textboxes
+      activeObjs.forEach(obj => {
+        if (obj.data?.isText && obj.text) {
+          if (obj.data.lineId) convertedLineIds.add(obj.data.lineId);
+          const matched = exact ? (obj.text.trim() === findStr) : obj.text.includes(findStr);
+          if (matched) {
+            const nextText = exact ? replaceStr : obj.text.replaceAll(findStr, replaceStr);
+            if (nextText !== obj.text) {
+              obj.set('text', nextText);
+              updateTextDimensionsAndMask(obj);
+              totalReplaced++;
+            }
+          }
+        }
+      });
+
+      // Step B: Replace unconverted PDF text lines on current page
+      let currentLines = state.pageTextLines[state.currentPage];
+      if (!currentLines || currentLines.length === 0) {
+        const page = await state.pdfDoc.getPage(state.currentPage);
+        const viewport = page.getViewport({ scale: state.baseScale });
+        currentLines = await extractPageTextLines(page, viewport);
+        state.pageTextLines[state.currentPage] = currentLines;
+      }
+
+      currentLines.forEach(line => {
+        if (convertedLineIds.has(line.id)) return;
+        const matched = exact ? (line.text.trim() === findStr) : line.text.includes(findStr);
+        if (matched) {
+          const nextText = exact ? replaceStr : line.text.replaceAll(findStr, replaceStr);
+          const tb = convertLineToTextbox(line, false);
+          if (tb) {
+            tb.set('text', nextText);
+            updateTextDimensionsAndMask(tb);
+            totalReplaced++;
+          }
+        }
+      });
+
+      fabricCanvas.requestRenderAll();
+      saveCurrentPageState(state.currentPage);
+    }
+
+    // 2. All Pages Processing (if scope === 'all')
+    if (scope === 'all' && state.totalPages > 1) {
+      for (let p = 1; p <= state.totalPages; p++) {
+        if (p === state.currentPage) continue;
+
+        let pLines = state.pageTextLines[p];
+        if (!pLines || pLines.length === 0) {
+          const page = await state.pdfDoc.getPage(p);
+          const viewport = page.getViewport({ scale: state.baseScale });
+          pLines = await extractPageTextLines(page, viewport);
+          state.pageTextLines[p] = pLines;
+        }
+
+        if (!state.pageStates[p]) {
+          state.pageStates[p] = { version: '5.3.0', objects: [] };
+        }
+
+        const pObjects = state.pageStates[p].objects || [];
+        const pConvertedLineIds = new Set();
+
+        pObjects.forEach(obj => {
+          if (obj.data?.isText && obj.text) {
+            if (obj.data.lineId) pConvertedLineIds.add(obj.data.lineId);
+            const matched = exact ? (obj.text.trim() === findStr) : obj.text.includes(findStr);
+            if (matched) {
+              const nextText = exact ? replaceStr : obj.text.replaceAll(findStr, replaceStr);
+              if (nextText !== obj.text) {
+                obj.text = nextText;
+                totalReplaced++;
+              }
+            }
+          }
+        });
+
+        pLines.forEach(line => {
+          if (pConvertedLineIds.has(line.id)) return;
+          const matched = exact ? (line.text.trim() === findStr) : line.text.includes(findStr);
+          if (matched) {
+            const nextText = exact ? replaceStr : line.text.replaceAll(findStr, replaceStr);
+            const maskId = 'mask_' + Math.random().toString(36).substr(2, 9);
+            const textId = 'text_' + Math.random().toString(36).substr(2, 9);
+            const isBoldFinal = Boolean(line.isBold);
+
+            const maskObj = {
+              type: 'rect',
+              version: '5.3.0',
+              left: Math.max(0, line.left - 2),
+              top: Math.max(0, line.top - 1),
+              width: line.width + 4,
+              height: Math.max(line.height + 2, line.canvasFontSize * 1.15),
+              fill: '#ffffff',
+              selectable: false,
+              evented: false,
+              strokeWidth: 0,
+              data: { isMask: true, id: maskId, lineId: line.id, linkedTextId: textId },
+            };
+
+            const textObj = {
+              type: 'textbox',
+              version: '5.3.0',
+              left: line.left,
+              top: line.top,
+              width: Math.max(line.width + 30, 60),
+              text: nextText,
+              fontSize: line.canvasFontSize,
+              fill: '#111827',
+              backgroundColor: 'transparent',
+              fontFamily: line.fontFamily || 'system-ui, -apple-system, sans-serif',
+              fontWeight: isBoldFinal ? 'bold' : 'normal',
+              splitByGrapheme: true,
+              editable: true,
+              data: {
+                isText: true,
+                id: textId,
+                lineId: line.id,
+                linkedMaskId: maskId,
+                originalText: line.text,
+                isBoldOriginal: isBoldFinal,
+              },
+            };
+
+            pObjects.push(maskObj, textObj);
+            totalReplaced++;
+          }
+        });
+
+        state.pageStates[p].objects = pObjects;
+      }
+    }
+
+    saveDraftToStorage();
+
+    if (totalReplaced > 0) {
+      showToast(`🎉 成功完成批量替换！共替换了 ${totalReplaced} 处内容`, 'success');
+      if (typeof confetti === 'function') {
+        confetti({ particleCount: 35, spread: 60, origin: { y: 0.8 } });
+      }
+    } else {
+      showToast('未找到需要替换的内容', 'info');
+    }
+  } catch (err) {
+    console.error('Batch replace error:', err);
+    showToast('批量替换失败: ' + err.message, 'error');
+  }
+}
+
+// ==========================================
+// 15. IndexedDB Auto-Save & Draft Recovery
+// ==========================================
+const DB_NAME = 'MobilePdfDraftsDB';
+const DB_VERSION = 1;
+const STORE_NAME = 'drafts';
+
+function openDraftDb() {
+  return new Promise((resolve) => {
+    if (!window.indexedDB) {
+      resolve(null);
+      return;
+    }
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    request.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+      }
+    };
+    request.onsuccess = (e) => resolve(e.target.result);
+    request.onerror = (e) => {
+      console.warn('IndexedDB open error:', e);
+      resolve(null);
+    };
+  });
+}
+
+let saveDraftTimeout = null;
+function saveDraftToStorage() {
+  if (!state.pdfData || !state.fileName) return;
+
+  clearTimeout(saveDraftTimeout);
+  saveDraftTimeout = setTimeout(async () => {
+    try {
+      const hasEdits = Object.values(state.pageStates).some(st => st?.objects?.length > 0) ||
+                       (fabricCanvas && fabricCanvas.getObjects().length > 0);
+      if (!hasEdits) return;
+
+      const db = await openDraftDb();
+      if (!db) return;
+
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      const record = {
+        id: 'active_draft',
+        fileName: state.fileName,
+        pdfData: state.pdfData,
+        pageStates: state.pageStates,
+        currentPage: state.currentPage,
+        timestamp: Date.now(),
+      };
+      store.put(record);
+    } catch (err) {
+      console.warn('Auto-save draft failed:', err);
+    }
+  }, 1000);
+}
+
+async function checkPendingDraftOnStartup() {
+  try {
+    const db = await openDraftDb();
+    if (!db) return;
+
+    const tx = db.transaction(STORE_NAME, 'readonly');
+    const store = tx.objectStore(STORE_NAME);
+    const req = store.get('active_draft');
+
+    req.onsuccess = () => {
+      const draft = req.result;
+      if (!draft || !draft.pdfData) return;
+
+      const dateStr = new Date(draft.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      elements.draftRecoveryText.textContent = `检测到您之前有未完成的编辑草稿（${draft.fileName || 'PDF文档'} · ${dateStr}）`;
+      elements.draftRecoveryBanner.classList.remove('hidden');
+      elements.draftRecoveryBanner.classList.add('flex');
+
+      elements.btnRestoreDraft.onclick = async () => {
+        try {
+          elements.draftRecoveryBanner.classList.add('hidden');
+          showToast('正在恢复历史编辑草稿...', 'info');
+          await openPdfFile(draft.pdfData, draft.fileName || '已恢复草稿.pdf', '', draft.pageStates);
+          if (draft.currentPage && draft.currentPage > 1) {
+            renderPage(draft.currentPage);
+          }
+          showToast('草稿已成功恢复！您可以继续编辑', 'success');
+        } catch (err) {
+          showToast('恢复草稿失败: ' + err.message, 'error');
+        }
+      };
+
+      elements.btnDiscardDraft.onclick = async () => {
+        elements.draftRecoveryBanner.classList.add('hidden');
+        clearDraftStorage();
+        showToast('已清除本地暂存草稿', 'info');
+      };
+    };
+  } catch (err) {
+    console.warn('Check pending draft error:', err);
+  }
+}
+
+async function clearDraftStorage() {
+  try {
+    const db = await openDraftDb();
+    if (!db) return;
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    tx.objectStore(STORE_NAME).delete('active_draft');
+  } catch (err) {
+    console.warn('Clear draft error:', err);
+  }
 }
 
 // Expose functions for debugging & tests
@@ -2118,12 +2633,15 @@ window.openCompareModal = openCompareModal;
 window.revertCurrentPage = revertCurrentPage;
 window.exportModifiedPdf = exportModifiedPdf;
 window.convertAllTextToEditable = convertAllTextToEditable;
+window.openBatchReplaceModal = openBatchReplaceModal;
+window.executeBatchReplace = executeBatchReplace;
 
 // Initialize Application
 function initApp() {
   setupEventListeners();
   initSignatureBoard();
   setupTouchAndPan();
+  checkPendingDraftOnStartup();
 }
 
 if (document.readyState === 'loading') {

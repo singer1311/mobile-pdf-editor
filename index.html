@@ -89,6 +89,13 @@
         <span class="sm:hidden">转Word</span>
       </button>
 
+      <!-- Batch Replace Button -->
+      <button id="btn-batch-replace" class="hidden px-2.5 sm:px-3 py-1.5 text-xs font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 active:bg-blue-200 border border-blue-300 rounded-lg flex items-center space-x-1.5 shadow-sm transition" title="一键批量替换数字、日期或文本内容">
+        <i class="fa-solid fa-arrow-right-arrow-left text-blue-600"></i>
+        <span class="hidden sm:inline">一键替换</span>
+        <span class="sm:hidden">替换</span>
+      </button>
+
       <!-- Compare & Preview Button -->
       <button id="btn-compare-preview" class="hidden px-2.5 sm:px-3 py-1.5 text-xs font-semibold text-purple-700 bg-purple-50 hover:bg-purple-100 active:bg-purple-200 border border-purple-300 rounded-lg flex items-center space-x-1.5 shadow-sm transition" title="与源文件原版对比，查看修改差异并方便快捷下载">
         <i class="fa-solid fa-code-compare text-purple-600"></i>
@@ -121,6 +128,22 @@
       </button>
     </div>
   </header>
+
+  <!-- Auto-Save Draft Recovery Notification Banner -->
+  <div id="draft-recovery-banner" class="hidden bg-gradient-to-r from-amber-500 to-amber-600 text-white px-3 py-2 text-xs flex items-center justify-between z-40 shadow-sm shrink-0">
+    <div class="flex items-center space-x-2 truncate">
+      <i class="fa-solid fa-clock-rotate-left shrink-0"></i>
+      <span id="draft-recovery-text" class="truncate font-medium">检测到您之前有未完成的编辑草稿</span>
+    </div>
+    <div class="flex items-center space-x-2 shrink-0 ml-2">
+      <button id="btn-restore-draft" class="px-2.5 py-1 bg-white text-amber-800 font-bold rounded shadow-sm hover:bg-amber-50 active:scale-95 transition text-[11px]">
+        立即恢复
+      </button>
+      <button id="btn-discard-draft" class="px-2 py-1 bg-amber-700 hover:bg-amber-800 text-white rounded active:scale-95 transition text-[11px]">
+        放弃并清除
+      </button>
+    </div>
+  </div>
 
   <!-- Word Mode Smart Tip Banner -->
   <div id="smart-edit-tip-banner" class="hidden bg-gradient-to-r from-blue-600 via-indigo-600 to-emerald-600 text-white px-3 py-1.5 text-xs flex items-center justify-between shadow-sm z-20 shrink-0">
@@ -234,6 +257,11 @@
       <div class="h-3.5 w-px bg-slate-700 mx-1"></div>
 
       <button id="btn-text-bold" class="w-6 h-6 rounded bg-slate-800 hover:bg-slate-700 flex items-center justify-center font-bold text-xs" title="加粗">B</button>
+      <div class="h-3.5 w-px bg-slate-700 mx-1"></div>
+      <button id="btn-replace-this-text" class="px-2 py-0.5 rounded bg-blue-600 hover:bg-blue-500 active:scale-95 text-[11px] font-medium flex items-center space-x-1 transition" title="以此内容为模板一键批量替换全文">
+        <i class="fa-solid fa-arrow-right-arrow-left text-[10px]"></i>
+        <span>替换</span>
+      </button>
     </div>
 
     <!-- Mask Controls -->
@@ -290,6 +318,14 @@
           <i class="fa-solid fa-wand-magic-sparkles"></i>
         </div>
         <span class="text-[10px] font-medium leading-none">一键转Word</span>
+      </button>
+
+      <!-- Tool: Batch Replace -->
+      <button id="tool-batch-replace" class="toolbar-btn flex flex-col items-center justify-center min-w-[56px] py-1 px-1.5 rounded-xl transition text-blue-600 hover:text-blue-700" title="一键批量替换数字或文本">
+        <div class="w-8 h-8 rounded-full flex items-center justify-center text-sm mb-0.5 tool-icon-bg bg-blue-50 text-blue-600">
+          <i class="fa-solid fa-arrow-right-arrow-left"></i>
+        </div>
+        <span class="text-[10px] font-medium leading-none">一键替换</span>
       </button>
 
       <!-- Tool 4: Browse/Pan -->
@@ -522,6 +558,97 @@
           <button id="btn-fast-download-pdf" class="px-5 py-2 text-xs font-bold text-white bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 active:scale-95 shadow-md shadow-blue-500/25 rounded-xl transition flex items-center space-x-2">
             <i class="fa-solid fa-download"></i>
             <span>立即下载修改后 PDF</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 6. Batch Find & Replace Modal -->
+  <div id="modal-batch-replace" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-sm p-3 sm:p-4 animate-fade-in">
+    <div class="bg-white rounded-2xl shadow-2xl border border-slate-200 max-w-md w-full overflow-hidden flex flex-col">
+      <!-- Modal Header -->
+      <div class="px-5 py-3.5 border-b border-slate-100 flex items-center justify-between bg-slate-50/70">
+        <div class="flex items-center space-x-2.5">
+          <div class="w-8 h-8 rounded-lg bg-blue-100 text-blue-600 flex items-center justify-center text-sm font-bold shadow-sm">
+            <i class="fa-solid fa-arrow-right-arrow-left"></i>
+          </div>
+          <div>
+            <h3 class="text-sm font-bold text-slate-800">一键批量查找替换</h3>
+            <p class="text-[11px] text-slate-500">将文档中所有相同的数字、金额、日期或文字一键替换</p>
+          </div>
+        </div>
+        <button id="btn-close-replace-modal" class="w-8 h-8 rounded-full text-slate-400 hover:text-slate-600 hover:bg-slate-100 flex items-center justify-center transition">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
+      </div>
+
+      <!-- Modal Body -->
+      <div class="p-4 sm:p-5 space-y-3.5">
+        <!-- Find Input -->
+        <div>
+          <label class="block text-xs font-semibold text-slate-700 mb-1 flex items-center justify-between">
+            <span>查找内容 (原数字 / 原文本)</span>
+            <span id="replace-match-count-badge" class="text-[11px] font-medium text-slate-400">请输入查找内容</span>
+          </label>
+          <div class="relative">
+            <input type="text" id="input-replace-find" placeholder="例如：11/15/23 或 $82.71 或 2023" class="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:bg-white text-slate-800 transition">
+            <button id="btn-clear-replace-find" class="hidden absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 text-xs">
+              <i class="fa-solid fa-circle-xmark"></i>
+            </button>
+          </div>
+        </div>
+
+        <!-- Replace Target Input -->
+        <div>
+          <label class="block text-xs font-semibold text-slate-700 mb-1">替换为 (新数字 / 新文本)</label>
+          <input type="text" id="input-replace-target" placeholder="例如：11/15/26 或 $95.00 或 2026" class="w-full px-3 py-2 bg-slate-50 border border-slate-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:bg-white text-slate-800 transition">
+        </div>
+
+        <!-- Options: Scope and Exact Match -->
+        <div class="bg-slate-50 rounded-xl p-3 border border-slate-200/80 space-y-2">
+          <div class="flex items-center justify-between text-xs">
+            <span class="font-medium text-slate-600">替换范围：</span>
+            <div class="flex items-center space-x-3">
+              <label class="inline-flex items-center space-x-1 cursor-pointer">
+                <input type="radio" name="replace-scope" value="current" checked class="text-blue-600 focus:ring-blue-500">
+                <span class="text-slate-700 text-xs">仅当前页</span>
+              </label>
+              <label class="inline-flex items-center space-x-1 cursor-pointer">
+                <input type="radio" name="replace-scope" value="all" class="text-blue-600 focus:ring-blue-500">
+                <span class="text-slate-700 text-xs">全文所有页面</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="flex items-center justify-between text-xs pt-1.5 border-t border-slate-200/60">
+            <span class="font-medium text-slate-600">匹配规则：</span>
+            <label class="inline-flex items-center space-x-1 cursor-pointer">
+              <input type="checkbox" id="chk-replace-exact" class="rounded text-blue-600 focus:ring-blue-500">
+              <span class="text-slate-700 text-xs">全词精确匹配 (不替换部分子串)</span>
+            </label>
+          </div>
+        </div>
+
+        <!-- Real-time matches preview list -->
+        <div id="replace-preview-container" class="hidden">
+          <p class="text-xs font-semibold text-slate-500 mb-1 flex items-center justify-between">
+            <span>匹配预览 (前 5 条)：</span>
+            <span id="replace-preview-hint" class="text-[10px] text-slate-400">将自动转换为 Word 文本框并保留字重格式</span>
+          </p>
+          <div id="replace-preview-list" class="max-h-24 overflow-y-auto space-y-1 text-xs text-slate-600 bg-slate-50 rounded-lg p-2 border border-slate-200 font-mono">
+          </div>
+        </div>
+      </div>
+
+      <!-- Modal Footer -->
+      <div class="px-5 py-3 border-t border-slate-100 flex items-center justify-between bg-slate-50/50">
+        <span class="text-[11px] text-slate-400">支持快捷键 Ctrl+H 打开</span>
+        <div class="flex items-center space-x-2">
+          <button id="btn-cancel-replace" class="px-3.5 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-100 rounded-xl transition">取消</button>
+          <button id="btn-execute-replace" class="px-4 py-1.5 text-xs font-bold text-white bg-blue-600 hover:bg-blue-700 active:scale-95 rounded-xl shadow-md shadow-blue-500/20 transition flex items-center space-x-1.5 disabled:opacity-40 disabled:pointer-events-none">
+            <i class="fa-solid fa-wand-magic-sparkles"></i>
+            <span>一键全部替换</span>
           </button>
         </div>
       </div>
