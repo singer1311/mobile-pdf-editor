@@ -41,7 +41,7 @@
   <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.2/dist/confetti.browser.min.js"></script>
 
   <!-- Custom Stylesheet -->
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=20261109v2">
 </head>
 <body class="bg-slate-100 text-slate-800 antialiased select-none overflow-hidden h-screen flex flex-col font-sans">
 
@@ -619,12 +619,12 @@
             <span class="font-medium text-slate-600">替换范围：</span>
             <div class="flex items-center space-x-3">
               <label class="inline-flex items-center space-x-1 cursor-pointer">
-                <input type="radio" name="replace-scope" value="current" checked class="text-blue-600 focus:ring-blue-500">
-                <span class="text-slate-700 text-xs">仅当前页</span>
+                <input type="radio" name="replace-scope" value="all" checked class="text-blue-600 focus:ring-blue-500">
+                <span class="text-slate-700 text-xs font-semibold">全文所有页面</span>
               </label>
               <label class="inline-flex items-center space-x-1 cursor-pointer">
-                <input type="radio" name="replace-scope" value="all" class="text-blue-600 focus:ring-blue-500">
-                <span class="text-slate-700 text-xs">全文所有页面</span>
+                <input type="radio" name="replace-scope" value="current" class="text-blue-600 focus:ring-blue-500">
+                <span class="text-slate-700 text-xs">仅当前页</span>
               </label>
             </div>
           </div>
@@ -670,6 +670,6 @@
   </div>
 
   <!-- Application Logic -->
-  <script src="app.js"></script>
+  <script src="app.js?v=20261109v2"></script>
 </body>
 </html>

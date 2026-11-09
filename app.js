@@ -58,6 +58,90 @@ window.state = state;
 // Fabric Canvas instance
 let fabricCanvas = null;
 
+// Custom Fabric properties preserved across page switches, drafts, and PDF export
+const SERIALIZE_PROPS = [
+  'data',
+  'isMask',
+  'isText',
+  'selectable',
+  'evented',
+  'editable',
+  'padding',
+  'borderColor',
+  'borderDashArray',
+  'borderScaleFactor',
+  'cornerColor',
+  'cornerSize',
+  'touchCornerSize',
+  'transparentCorners',
+];
+
+let _measureCanvas = null;
+function measureTextLineWidth(text, fontSize = 16, fontWeight = 'normal', fontFamily = 'system-ui, -apple-system, sans-serif') {
+  try {
+    if (!_measureCanvas) _measureCanvas = document.createElement('canvas');
+    const ctx = _measureCanvas.getContext('2d');
+    ctx.font = `${fontWeight || 'normal'} ${fontSize || 16}px ${fontFamily || 'system-ui, -apple-system, sans-serif'}`;
+    let maxW = 0;
+    for (const line of String(text || '').split('\n')) {
+      const w = ctx.measureText(line).width;
+      if (w > maxW) maxW = w;
+    }
+    return maxW;
+  } catch (e) {
+    return String(text || '').length * (fontSize || 16) * 0.55;
+  }
+}
+
+// Ensures serialized Fabric JSON is 100% valid for Fabric 5.3.1 loadFromJSON (prevents stylesToArray/stylesFromArray crashes)
+function normalizePageStateJson(pageState) {
+  if (!pageState || typeof pageState !== 'object') return pageState;
+  const cloned = JSON.parse(JSON.stringify(pageState));
+  delete cloned.viewportTransform;
+  if (!Array.isArray(cloned.objects)) {
+    cloned.objects = [];
+    return cloned;
+  }
+  cloned.objects.forEach(o => {
+    if (!o || typeof o !== 'object') return;
+    if (o.type === 'textbox' || o.type === 'i-text' || o.type === 'text') {
+      o.styles = Array.isArray(o.styles) ? o.styles.filter(Boolean) : [];
+      if (o.padding === undefined) o.padding = 0;
+      if (!o.lineHeight) o.lineHeight = 1.05;
+    }
+    if (o.data?.isMask && o.data?.linkedTextId) {
+      o.selectable = false;
+      o.evented = false;
+    }
+  });
+  return cloned;
+}
+
+function normalizeAllPageStates(pageStates) {
+  if (!pageStates || typeof pageStates !== 'object') return {};
+  const result = {};
+  for (const [pageKey, st] of Object.entries(pageStates)) {
+    if (st) result[pageKey] = normalizePageStateJson(st);
+  }
+  return result;
+}
+
+// Ensures live Fabric Canvas / StaticCanvas objects never have undefined/invalid styles before toJSON()
+function sanitizeFabricCanvasObjects(targetCanvas) {
+  if (!targetCanvas || typeof targetCanvas.getObjects !== 'function') return;
+  targetCanvas.getObjects().forEach(o => {
+    if (o.type === 'textbox' || o.type === 'i-text' || o.type === 'text') {
+      if (!o.styles || typeof o.styles !== 'object' || Array.isArray(o.styles)) {
+        o.styles = {};
+      }
+    }
+    if (o.data?.isMask && o.data?.linkedTextId && targetCanvas === fabricCanvas && state.tool !== 'mask') {
+      o.selectable = false;
+      o.evented = false;
+    }
+  });
+}
+
 // DOM Elements
 const elements = {
   viewportWrapper: document.getElementById('viewport-wrapper'),
@@ -254,7 +338,7 @@ async function openPdfFile(arrayBuffer, fileName = 'document.pdf', password = ''
     state.pdfDoc = await loadingTask.promise;
     state.totalPages = state.pdfDoc.numPages;
     state.currentPage = 1;
-    state.pageStates = initialPageStates ? JSON.parse(JSON.stringify(initialPageStates)) : {}; // Restore draft edits if present
+    state.pageStates = initialPageStates ? normalizeAllPageStates(initialPageStates) : {}; // Restore & self-heal draft edits if present
     state.historyStack = {};
 
     hidePasswordModal();
@@ -394,8 +478,11 @@ async function renderPage(pageNum) {
 
     // 5. Restore saved objects for this page
     if (state.pageStates[pageNum]) {
+      const normalizedState = normalizePageStateJson(state.pageStates[pageNum]);
+      state.pageStates[pageNum] = normalizedState;
       await new Promise(resolve => {
-        fabricCanvas.loadFromJSON(state.pageStates[pageNum], () => {
+        fabricCanvas.loadFromJSON(normalizedState, () => {
+          sanitizeFabricCanvasObjects(fabricCanvas);
           sanitizeMaskColors();
           fabricCanvas.renderAll();
           resolve();
@@ -429,7 +516,10 @@ async function renderPage(pageNum) {
 function saveCurrentPageState(pageNum) {
   if (!fabricCanvas) return;
   const p = pageNum || state.currentPage;
-  state.pageStates[p] = fabricCanvas.toJSON(['data', 'isMask', 'isText']);
+  sanitizeFabricCanvasObjects(fabricCanvas);
+  const json = fabricCanvas.toJSON(SERIALIZE_PROPS);
+  delete json.viewportTransform;
+  state.pageStates[p] = normalizePageStateJson(json);
   saveDraftToStorage();
 }
 
@@ -562,12 +652,28 @@ function applyCurrentMode() {
     fabricCanvas.discardActiveObject();
     fabricCanvas.defaultCursor = 'crosshair';
     fabricCanvas.hoverCursor = 'crosshair';
-    fabricCanvas.forEachObject(obj => obj.selectable = true);
+    fabricCanvas.forEachObject(obj => {
+      if (obj.data?.isMask && obj.data?.linkedTextId && state.tool !== 'mask') {
+        obj.selectable = false;
+        obj.evented = false;
+      } else {
+        obj.selectable = true;
+        obj.evented = true;
+      }
+    });
   } else {
     fabricCanvas.selection = true;
     fabricCanvas.defaultCursor = 'default';
     fabricCanvas.hoverCursor = 'move';
-    fabricCanvas.forEachObject(obj => obj.selectable = true);
+    fabricCanvas.forEachObject(obj => {
+      if (obj.data?.isMask && obj.data?.linkedTextId) {
+        obj.selectable = false;
+        obj.evented = false;
+      } else {
+        obj.selectable = true;
+        obj.evented = true;
+      }
+    });
   }
 
   updatePropertyBar();
@@ -780,11 +886,14 @@ function setupFabricEventListeners() {
   });
 }
 
-// Detect if the text is inside a colored container (e.g. a dark blue header card) and find its right boundary
-function findContainerRightBoundary(left, top, width, maskColor) {
+// Detect if the text is inside a colored container (e.g. a dark blue header card or pastel callout box) and find its right boundary
+function findContainerRightBoundary(left, top, width, maskColor, sourceCanvas = null, height = 14) {
   try {
-    const pdfCanvas = elements.pdfCanvas;
+    const pdfCanvas = sourceCanvas || elements.pdfCanvas;
     if (!pdfCanvas || !maskColor) return 0;
+    // White masks on white paper never visually protrude; allow free expansion over neighboring text
+    if (maskColor.toLowerCase() === '#ffffff') return 0;
+
     const ctx = pdfCanvas.getContext('2d', { willReadFrequently: true });
 
     let targetR, targetG, targetB;
@@ -798,22 +907,35 @@ function findContainerRightBoundary(left, top, width, maskColor) {
       return 0;
     }
 
-    // Start scanning from the right edge of the text line
-    const startX = Math.round(left + width);
-    const y = Math.round(top + 4);
-    if (startX < 0 || startX >= pdfCanvas.width || y < 0 || y >= pdfCanvas.height) return 0;
+    // Scan from just inside the left edge so even previously oversized masks snap to the true container edge
+    const scanStartX = Math.max(0, Math.round(left + Math.min(width || 12, 12)));
+    const maxScanLen = Math.min(600, pdfCanvas.width - scanStartX);
+    if (maxScanLen <= 3) return 0;
 
-    const scanLen = Math.min(300, pdfCanvas.width - startX);
-    const rowData = ctx.getImageData(startX, y, scanLen, 1).data;
+    const h = Math.max(4, Math.round(height || 14));
+    const y1 = Math.min(pdfCanvas.height - 1, Math.max(0, Math.round(top + 1)));
+    const y2 = Math.min(pdfCanvas.height - 1, Math.max(0, Math.round(top + h * 0.5)));
+    const y3 = Math.min(pdfCanvas.height - 1, Math.max(0, Math.round(top + h - 2)));
 
-    for (let i = 0; i < scanLen; i++) {
-      const r = rowData[i * 4];
-      const g = rowData[i * 4 + 1];
-      const b = rowData[i * 4 + 2];
-      const diff = Math.abs(r - targetR) + Math.abs(g - targetG) + Math.abs(b - targetB);
-      if (diff > 50) {
-        // Container boundary reached at startX + i; total allowed width from left is width + i
-        return Math.max(width, width + i);
+    const row1 = ctx.getImageData(scanStartX, y1, maxScanLen, 1).data;
+    const row2 = ctx.getImageData(scanStartX, y2, maxScanLen, 1).data;
+    const row3 = ctx.getImageData(scanStartX, y3, maxScanLen, 1).data;
+
+    const isOutside = (row, idx) => {
+      const i = idx * 4;
+      const diff = Math.abs(row[i] - targetR) + Math.abs(row[i + 1] - targetG) + Math.abs(row[i + 2] - targetB);
+      return diff > 22;
+    };
+
+    // Require 3 consecutive X columns where top, middle, and bottom all exit the container fill
+    for (let i = 0; i < maxScanLen - 2; i++) {
+      if (
+        isOutside(row1, i) && isOutside(row2, i) && isOutside(row3, i) &&
+        isOutside(row1, i + 1) && isOutside(row2, i + 1) && isOutside(row3, i + 1) &&
+        isOutside(row1, i + 2) && isOutside(row2, i + 2) && isOutside(row3, i + 2)
+      ) {
+        const edgeX = scanStartX + i;
+        return Math.max(8, Math.floor(edgeX - left));
       }
     }
     return 0;
@@ -827,25 +949,16 @@ function updateTextDimensionsAndMask(obj) {
   if (!obj || !obj.data?.isText) return;
 
   // 1. Calculate true text width across all lines
-  const lines = (obj.text || '').split('\n');
-  let maxLineWidth = 0;
-  const ctx = fabricCanvas ? fabricCanvas.getContext() : null;
-
-  if (ctx) {
-    ctx.save();
-    ctx.font = `${obj.fontWeight || 'normal'} ${obj.fontSize || 16}px ${obj.fontFamily || 'sans-serif'}`;
-    for (const l of lines) {
-      const w = ctx.measureText(l).width;
-      if (w > maxLineWidth) maxLineWidth = w;
-    }
-    ctx.restore();
-  } else {
-    maxLineWidth = (obj.getLineWidth ? obj.getLineWidth(0) : obj.width) || 50;
-  }
+  const maxLineWidth = measureTextLineWidth(
+    obj.text || '',
+    obj.fontSize || 16,
+    obj.fontWeight || 'normal',
+    obj.fontFamily || 'system-ui, -apple-system, sans-serif'
+  );
 
   // 2. Expand textbox width for cursor room, transparent so zero visual side-effects
   const baseWidth = obj.data.initialWidth || 50;
-  const desiredWidth = Math.max(baseWidth, Math.ceil(maxLineWidth + 12));
+  const desiredWidth = Math.max(baseWidth, Math.ceil(maxLineWidth + 16));
   if (desiredWidth > obj.width) {
     obj.set('width', desiredWidth);
     if (obj.initDimensions) obj.initDimensions();
@@ -856,15 +969,16 @@ function updateTextDimensionsAndMask(obj) {
     const mask = fabricCanvas.getObjects().find(o => o.data?.id === obj.data.linkedMaskId);
     if (mask) {
       const origMaskWidth = obj.data.initialMaskWidth || mask.data?.initialMaskWidth || mask.width;
-      
-      // Only expand mask if the user typed text that is actually wider than the original line!
+      const isModified = (obj.data.originalText === undefined || obj.text !== obj.data.originalText);
+
+      // Only expand mask beyond original PDF ink width when user actually modified the text and made it wider
       let targetMaskWidth = origMaskWidth;
-      if (maxLineWidth > origMaskWidth - 2) {
+      if (isModified && maxLineWidth > origMaskWidth - 1) {
         targetMaskWidth = Math.ceil(maxLineWidth + 2);
       }
 
       // Clamp to container right boundary if inside a colored card/block
-      const maxAllowed = findContainerRightBoundary(mask.left, mask.top, origMaskWidth, mask.fill);
+      const maxAllowed = findContainerRightBoundary(mask.left, mask.top, origMaskWidth, mask.fill, null, mask.height);
       if (maxAllowed > 0 && targetMaskWidth > maxAllowed) {
         targetMaskWidth = maxAllowed;
       }
@@ -961,16 +1075,25 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
   // 1. Sample surrounding background color and text contrast color
   const colors = samplePdfColors(line.left, line.top, line.width, line.height);
   const isBoldFinal = Boolean(line.isBold);
+  const fontFamilyFinal = line.fontFamily || 'system-ui, -apple-system, sans-serif';
 
   const maskId = 'mask_' + Math.random().toString(36).substr(2, 9);
   const textId = 'text_' + Math.random().toString(36).substr(2, 9);
 
+  const maskTop = Math.max(0, line.top - 1);
+  const maskHeight = Math.max(line.height + 2, line.canvasFontSize * 1.15);
+  let initialMaskWidth = line.width;
+  const maxAllowedMask = findContainerRightBoundary(line.left, maskTop, initialMaskWidth, colors.bgColor, null, maskHeight);
+  if (maxAllowedMask > 0 && initialMaskWidth > maxAllowedMask) {
+    initialMaskWidth = maxAllowedMask;
+  }
+
   // 2. Solid background mask perfectly covers original PDF text (tight bounds)
   const maskRect = new fabric.Rect({
     left: line.left,
-    top: Math.max(0, line.top - 1),
-    width: line.width,
-    height: Math.max(line.height + 2, line.canvasFontSize * 1.15),
+    top: maskTop,
+    width: initialMaskWidth,
+    height: maskHeight,
     fill: colors.bgColor,
     selectable: false,
     evented: false,
@@ -980,15 +1103,15 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
       id: maskId, 
       lineId: line.id, 
       linkedTextId: textId,
-      initialMaskWidth: line.width,
+      initialMaskWidth: initialMaskWidth,
       initialLeft: line.left,
       bgColor: colors.bgColor,
     },
   });
   fabricCanvas.add(maskRect);
 
-  const initialWidth = Math.max(line.width + 12, 40);
-  const initialMaskWidth = line.width;
+  const measuredW = measureTextLineWidth(line.text, line.canvasFontSize, isBoldFinal ? 'bold' : 'normal', fontFamilyFinal);
+  const initialWidth = Math.max(line.width + 16, Math.ceil(measuredW + 16), 40);
 
   // 3. In-place editable Textbox preserving original font size, color, weight, and font family
   const textbox = new fabric.Textbox(line.text, {
@@ -998,7 +1121,7 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
     fontSize: line.canvasFontSize,
     fill: colors.textColor,
     backgroundColor: 'transparent',
-    fontFamily: line.fontFamily || 'system-ui, -apple-system, sans-serif',
+    fontFamily: fontFamilyFinal,
     fontWeight: isBoldFinal ? 'bold' : 'normal',
     splitByGrapheme: true,
     editable: true,
@@ -1070,6 +1193,10 @@ async function convertAllTextToEditable() {
 
   let count = 0;
   for (const line of lines) {
+    // Skip hidden/invisible PDF metadata text (e.g. white-on-white internal tags with 0 visible ink pixels)
+    const sampled = samplePdfColors(line.left, line.top, line.width, line.height);
+    if (!sampled.hasVisibleInk) continue;
+
     // Avoid creating duplicates if a textbox already covers this position
     const alreadyExists = fabricCanvas.getObjects().some(o => 
       o.data?.isText &&
@@ -1172,7 +1299,9 @@ async function extractPageTextLines(page, viewport) {
       const [vx, vy] = viewport.convertToViewportPoint(it.transform[4], it.transform[5]);
       const pdfFontSize = Math.hypot(it.transform[0], it.transform[1]) || 12;
       const canvasFontSize = Math.round(pdfFontSize * state.baseScale);
-      const width = Math.max(it.width * state.baseScale, it.str.length * canvasFontSize * 0.52);
+      const width = (it.width && it.width > 0)
+        ? (it.width * state.baseScale + 2)
+        : Math.max(8, it.str.length * canvasFontSize * 0.5);
       const height = (it.height || pdfFontSize) * state.baseScale;
       const top = vy - canvasFontSize * 0.95;
 
@@ -1248,7 +1377,7 @@ async function extractPageTextLines(page, viewport) {
 function samplePdfColors(left, top, width, height, sourceCanvas = null) {
   try {
     const pdfCanvas = sourceCanvas || elements.pdfCanvas;
-    if (!pdfCanvas) return { bgColor: '#ffffff', textColor: '#111827' };
+    if (!pdfCanvas) return { bgColor: '#ffffff', textColor: '#111827', hasVisibleInk: true };
     const ctx = pdfCanvas.getContext('2d', { willReadFrequently: true });
 
     const l = Math.max(0, Math.floor(left));
@@ -1256,7 +1385,7 @@ function samplePdfColors(left, top, width, height, sourceCanvas = null) {
     const w = Math.min(pdfCanvas.width - l, Math.ceil(width));
     const h = Math.min(pdfCanvas.height - t, Math.ceil(height));
 
-    if (w <= 0 || h <= 0) return { bgColor: '#ffffff', textColor: '#111827' };
+    if (w <= 0 || h <= 0) return { bgColor: '#ffffff', textColor: '#111827', hasVisibleInk: true };
 
     // 1. Interior mode sampling: characters take ~15-25% of area; background is the dominant mode
     // Sample strictly INSIDE the text box to avoid grabbing outside borders or lines
@@ -1333,6 +1462,20 @@ function samplePdfColors(left, top, width, height, sourceCanvas = null) {
       }
     }
 
+    // Fallback full-pixel check for very thin strokes (e.g. '1', '.', '|') so visible glyphs are never missed
+    if (textCount === 0) {
+      for (let i = 0; i < imgData.length; i += 4) {
+        if (imgData[i + 3] < 80) continue;
+        const dist = Math.abs(imgData[i] - bg.r) + Math.abs(imgData[i + 1] - bg.g) + Math.abs(imgData[i + 2] - bg.b);
+        if (dist > 30) {
+          textR += imgData[i];
+          textG += imgData[i + 1];
+          textB += imgData[i + 2];
+          textCount++;
+        }
+      }
+    }
+
     let text = { r: 17, g: 24, b: 39 }; // Default dark charcoal
     if (textCount > 0) {
       text = {
@@ -1358,25 +1501,84 @@ function samplePdfColors(left, top, width, height, sourceCanvas = null) {
     return {
       bgColor: toHex(bg),
       textColor: toHex(text),
+      hasVisibleInk: textCount > 0,
     };
   } catch (err) {
     console.warn('samplePdfColors error:', err);
-    return { bgColor: '#ffffff', textColor: '#111827' };
+    return { bgColor: '#ffffff', textColor: '#111827', hasVisibleInk: true };
   }
 }
 
-// Auto-heals any legacy bugged yellow/lime masks from older drafts or sessions
+// Auto-heals any legacy bugged yellow/lime masks, protruding masks, or invisible ghost metadata from older drafts
 function sanitizeMaskColors() {
   if (!fabricCanvas) return;
   let modified = false;
-  fabricCanvas.getObjects().forEach(o => {
+  const objects = [...fabricCanvas.getObjects()];
+  const toRemove = new Set();
+
+  objects.forEach(o => {
+    if (toRemove.has(o)) return;
+
+    // 1. Heal legacy bit-shift yellow/lime masks
     if (o.data?.isMask && (o.fill === '#e0f900' || o.fill === '#e4f850' || o.fill === '#e0f800')) {
       const trueColors = samplePdfColors(o.left, o.top, o.width, o.height);
       o.set('fill', trueColors.bgColor);
       if (o.data) o.data.bgColor = trueColors.bgColor;
       modified = true;
     }
+
+    // 2. Clamp any colored mask that protrudes beyond its colored box boundary
+    if (o.data?.isMask && o.fill && o.fill.toLowerCase() !== '#ffffff') {
+      const maxAllowed = findContainerRightBoundary(o.left, o.top, o.width, o.fill, null, o.height);
+      if (maxAllowed > 0 && o.width > maxAllowed + 1) {
+        o.set('width', maxAllowed);
+        if (o.data && o.data.initialMaskWidth > maxAllowed) {
+          o.data.initialMaskWidth = maxAllowed;
+        }
+        modified = true;
+      }
+    }
+
+    // 3. Remove unmodified ghost textboxes created over invisible white-on-white PDF metadata (e.g. 'Counter')
+    if (o.data?.isText && o.data?.originalText !== undefined && o.text === o.data.originalText && o.data?.linkedMaskId) {
+      const mask = objects.find(m => m.data?.id === o.data.linkedMaskId);
+      const checkW = mask ? mask.width : o.width;
+      const checkH = mask ? mask.height : (o.height || 16);
+      const checkColors = samplePdfColors(o.left, o.top, checkW, checkH);
+      if (!checkColors.hasVisibleInk) {
+        toRemove.add(o);
+        if (mask) toRemove.add(mask);
+        modified = true;
+      }
+    }
   });
+
+  if (toRemove.size > 0) {
+    toRemove.forEach(item => fabricCanvas.remove(item));
+  }
+
+  // 4. Ensure modified textboxes from off-screen batch replace have sufficient width & mask coverage
+  fabricCanvas.getObjects().forEach(o => {
+    if (o.data?.isText && o.data?.linkedMaskId && o.data?.originalText !== undefined && o.text !== o.data.originalText) {
+      const maxLineW = measureTextLineWidth(o.text || '', o.fontSize || 16, o.fontWeight || 'normal', o.fontFamily);
+      if (maxLineW + 14 > o.width) {
+        o.set('width', Math.ceil(maxLineW + 16));
+        if (o.initDimensions) o.initDimensions();
+        modified = true;
+      }
+      const mask = fabricCanvas.getObjects().find(m => m.data?.id === o.data.linkedMaskId);
+      if (mask && maxLineW > mask.width) {
+        let nextMaskW = Math.ceil(maxLineW + 2);
+        const maxAllowed = findContainerRightBoundary(mask.left, mask.top, mask.width, mask.fill, null, mask.height);
+        if (maxAllowed > 0 && nextMaskW > maxAllowed) nextMaskW = maxAllowed;
+        if (nextMaskW !== mask.width) {
+          mask.set('width', nextMaskW);
+          modified = true;
+        }
+      }
+    }
+  });
+
   if (modified) {
     fabricCanvas.requestRenderAll();
     saveCurrentPageState(state.currentPage);
@@ -1770,24 +1972,30 @@ async function exportModifiedPdf() {
 
 // Generates transparent overlay PNG for a single page
 async function generatePageOverlayPng(pageNum) {
-  const jsonState = (pageNum === state.currentPage && fabricCanvas) 
-    ? fabricCanvas.toJSON(['data', 'isMask', 'isText']) 
+  const rawState = (pageNum === state.currentPage && fabricCanvas)
+    ? (() => { sanitizeFabricCanvasObjects(fabricCanvas); return fabricCanvas.toJSON(SERIALIZE_PROPS); })()
     : state.pageStates[pageNum];
 
+  const jsonState = normalizePageStateJson(rawState);
   if (!jsonState || !jsonState.objects || jsonState.objects.length === 0) {
     return null;
   }
+
+  const page = await state.pdfDoc.getPage(pageNum);
+  const baseViewport = page.getViewport({ scale: state.baseScale });
 
   return new Promise(resolve => {
     const tempCanvas = document.createElement('canvas');
     const staticCanvas = new fabric.StaticCanvas(tempCanvas, {
       enableRetinaScaling: false
     });
-    staticCanvas.setWidth(state.baseWidth);
-    staticCanvas.setHeight(state.baseHeight);
+    staticCanvas.setWidth(baseViewport.width);
+    staticCanvas.setHeight(baseViewport.height);
     staticCanvas.setZoom(1.0);
 
     staticCanvas.loadFromJSON(jsonState, () => {
+      sanitizeFabricCanvasObjects(staticCanvas);
+      staticCanvas.setViewportTransform([1, 0, 0, 1, 0, 0]);
       staticCanvas.renderAll();
       const url = staticCanvas.toDataURL({ format: 'png', multiplier: 1 });
       staticCanvas.dispose();
@@ -1811,11 +2019,14 @@ async function renderDecryptedPageComposite(pageNum) {
   await page.render({ canvasContext: ctx, viewport: renderViewport }).promise;
 
   // 2. Render fabric modifications on top
-  const jsonState = (pageNum === state.currentPage && fabricCanvas) 
-    ? fabricCanvas.toJSON(['data', 'isMask', 'isText']) 
+  const rawState = (pageNum === state.currentPage && fabricCanvas)
+    ? (() => { sanitizeFabricCanvasObjects(fabricCanvas); return fabricCanvas.toJSON(SERIALIZE_PROPS); })()
     : state.pageStates[pageNum];
 
+  const jsonState = normalizePageStateJson(rawState);
+
   if (jsonState && jsonState.objects && jsonState.objects.length > 0) {
+    const scaleFactor = 2.0 / state.baseScale;
     await new Promise(resolve => {
       const fabricOffscreen = document.createElement('canvas');
       const staticCanvas = new fabric.StaticCanvas(fabricOffscreen, {
@@ -1823,9 +2034,11 @@ async function renderDecryptedPageComposite(pageNum) {
       });
       staticCanvas.setWidth(renderViewport.width);
       staticCanvas.setHeight(renderViewport.height);
-      staticCanvas.setZoom(2.0 / state.baseScale);
+      staticCanvas.setZoom(scaleFactor);
 
       staticCanvas.loadFromJSON(jsonState, () => {
+        sanitizeFabricCanvasObjects(staticCanvas);
+        staticCanvas.setViewportTransform([scaleFactor, 0, 0, scaleFactor, 0, 0]);
         staticCanvas.renderAll();
         ctx.drawImage(fabricOffscreen, 0, 0, renderViewport.width, renderViewport.height);
         staticCanvas.dispose();
@@ -1875,24 +2088,22 @@ async function openCompareModal() {
     await page.render({ canvasContext: origCtx, viewport }).promise;
     elements.compareOriginalImg.src = origCanvas.toDataURL('image/png');
 
-    // 2. Render modified composite page (original PDF + Fabric modifications)
+    // 2. Render modified composite page (original PDF + clean Retina-independent Fabric overlay)
     const compCanvas = document.createElement('canvas');
     compCanvas.width = viewport.width;
     compCanvas.height = viewport.height;
     const compCtx = compCanvas.getContext('2d');
     compCtx.drawImage(origCanvas, 0, 0);
 
-    if (fabricCanvas) {
-      const fabricDataUrl = fabricCanvas.toDataURL({
-        format: 'png',
-        multiplier: 1.0 / state.currentZoom,
-      });
+    const fabricDataUrl = await generatePageOverlayPng(state.currentPage);
+    if (fabricDataUrl) {
       await new Promise((resolve) => {
         const overlayImg = new Image();
         overlayImg.onload = () => {
           compCtx.drawImage(overlayImg, 0, 0, viewport.width, viewport.height);
           resolve();
         };
+        overlayImg.onerror = () => resolve();
         overlayImg.src = fabricDataUrl;
       });
     }
@@ -2354,10 +2565,12 @@ function closeBatchReplaceModal() {
   elements.modalBatchReplace.classList.add('hidden');
 }
 
-// Compute live matching preview
+// Compute live matching preview across current or all pages (extracts unvisited pages on demand)
+let _replacePreviewSeq = 0;
 async function updateReplacePreview() {
+  const mySeq = ++_replacePreviewSeq;
   const findStr = (elements.inputReplaceFind.value || '').trim();
-  const scope = document.querySelector('input[name="replace-scope"]:checked')?.value || 'current';
+  const scope = document.querySelector('input[name="replace-scope"]:checked')?.value || 'all';
   const exact = elements.chkReplaceExact.checked;
 
   if (!findStr) {
@@ -2379,7 +2592,7 @@ async function updateReplacePreview() {
     : [state.currentPage];
 
   for (const p of pagesToScan) {
-    // 1. Check existing fabric textboxes on current page
+    // 1. Check existing fabric textboxes on current page or saved state
     if (p === state.currentPage && fabricCanvas) {
       const activeObjs = fabricCanvas.getObjects();
       for (const obj of activeObjs) {
@@ -2407,8 +2620,21 @@ async function updateReplacePreview() {
       }
     }
 
-    // 2. Check unconverted text lines in pageTextLines
-    const lines = state.pageTextLines[p] || [];
+    // 2. Lazily extract text lines for unvisited pages so Page 2+ matches are always discovered!
+    let lines = state.pageTextLines[p];
+    if ((!lines || lines.length === 0) && state.pdfDoc) {
+      try {
+        const page = await state.pdfDoc.getPage(p);
+        const viewport = page.getViewport({ scale: state.baseScale });
+        lines = await extractPageTextLines(page, viewport);
+        state.pageTextLines[p] = lines;
+      } catch (e) {
+        console.warn(`Extract lines for page ${p} failed:`, e);
+        lines = [];
+      }
+    }
+    lines = lines || [];
+
     const convertedLineIds = new Set();
     if (p === state.currentPage && fabricCanvas) {
       fabricCanvas.getObjects().forEach(o => {
@@ -2432,6 +2658,8 @@ async function updateReplacePreview() {
     }
   }
 
+  if (mySeq !== _replacePreviewSeq) return;
+
   if (matchCount > 0) {
     elements.replaceMatchCountBadge.textContent = `找到 ${matchCount} 处匹配项`;
     elements.replaceMatchCountBadge.className = 'text-[11px] font-bold text-emerald-600';
@@ -2452,7 +2680,7 @@ async function updateReplacePreview() {
 async function executeBatchReplace() {
   const findStr = (elements.inputReplaceFind.value || '').trim();
   const replaceStr = elements.inputReplaceTarget.value || '';
-  const scope = document.querySelector('input[name="replace-scope"]:checked')?.value || 'current';
+  const scope = document.querySelector('input[name="replace-scope"]:checked')?.value || 'all';
   const exact = elements.chkReplaceExact.checked;
 
   if (!findStr) {
@@ -2500,6 +2728,8 @@ async function executeBatchReplace() {
         if (convertedLineIds.has(line.id)) return;
         const matched = exact ? (line.text.trim() === findStr) : line.text.includes(findStr);
         if (matched) {
+          const sampled = samplePdfColors(line.left, line.top, line.width, line.height);
+          if (!sampled.hasVisibleInk) return;
           const nextText = exact ? replaceStr : line.text.replaceAll(findStr, replaceStr);
           const tb = convertLineToTextbox(line, false);
           if (tb) {
@@ -2529,28 +2759,21 @@ async function executeBatchReplace() {
 
         if (!state.pageStates[p]) {
           state.pageStates[p] = { version: '5.3.0', objects: [] };
+        } else {
+          state.pageStates[p] = normalizePageStateJson(state.pageStates[p]);
         }
 
         const pObjects = state.pageStates[p].objects || [];
         const pConvertedLineIds = new Set();
-
         pObjects.forEach(obj => {
-          if (obj.data?.isText && obj.text) {
-            if (obj.data.lineId) pConvertedLineIds.add(obj.data.lineId);
-            const matched = exact ? (obj.text.trim() === findStr) : obj.text.includes(findStr);
-            if (matched) {
-              const nextText = exact ? replaceStr : obj.text.replaceAll(findStr, replaceStr);
-              if (nextText !== obj.text) {
-                obj.text = nextText;
-                totalReplaced++;
-              }
-            }
-          }
+          if (obj.data?.isText && obj.data.lineId) pConvertedLineIds.add(obj.data.lineId);
         });
 
+        const hasExistingMatches = pObjects.some(obj => obj.data?.isText && obj.text && (exact ? (obj.text.trim() === findStr) : obj.text.includes(findStr)));
         const hasUnconvertedMatches = pLines.some(line => !pConvertedLineIds.has(line.id) && (exact ? (line.text.trim() === findStr) : line.text.includes(findStr)));
+
         let pCanvas = null;
-        if (hasUnconvertedMatches) {
+        if (hasExistingMatches || hasUnconvertedMatches) {
           try {
             const page = await state.pdfDoc.getPage(p);
             const viewport = page.getViewport({ scale: state.baseScale });
@@ -2564,44 +2787,100 @@ async function executeBatchReplace() {
           }
         }
 
+        // Step A: Update already-converted textboxes on page p
+        pObjects.forEach(obj => {
+          if (obj.data?.isText && obj.text) {
+            const matched = exact ? (obj.text.trim() === findStr) : obj.text.includes(findStr);
+            if (matched) {
+              const nextText = exact ? replaceStr : obj.text.replaceAll(findStr, replaceStr);
+              if (nextText !== obj.text) {
+                obj.text = nextText;
+                obj.styles = Array.isArray(obj.styles) ? obj.styles : [];
+                const measuredW = measureTextLineWidth(nextText, obj.fontSize || 16, obj.fontWeight || 'normal', obj.fontFamily);
+                obj.width = Math.max(obj.width || 40, Math.ceil(measuredW + 16));
+                if (obj.data?.linkedMaskId) {
+                  const linkedMask = pObjects.find(m => m.data?.id === obj.data.linkedMaskId);
+                  if (linkedMask) {
+                    const origMaskW = obj.data.initialMaskWidth || linkedMask.data?.initialMaskWidth || linkedMask.width;
+                    let targetMaskW = Math.max(origMaskW, Math.ceil(measuredW + 2));
+                    const maxAllowed = findContainerRightBoundary(linkedMask.left, linkedMask.top, origMaskW, linkedMask.fill, pCanvas, linkedMask.height);
+                    if (maxAllowed > 0 && targetMaskW > maxAllowed) targetMaskW = maxAllowed;
+                    linkedMask.width = targetMaskW;
+                  }
+                }
+                totalReplaced++;
+              }
+            }
+          }
+        });
+
+        // Step B: Create authentic serialized Fabric Rect + Textbox objects for unconverted matches on page p
         pLines.forEach(line => {
           if (pConvertedLineIds.has(line.id)) return;
           const matched = exact ? (line.text.trim() === findStr) : line.text.includes(findStr);
           if (matched) {
+            const lineColors = samplePdfColors(line.left, line.top, line.width, line.height, pCanvas);
+            if (!lineColors.hasVisibleInk) return;
+
             const nextText = exact ? replaceStr : line.text.replaceAll(findStr, replaceStr);
             const maskId = 'mask_' + Math.random().toString(36).substr(2, 9);
             const textId = 'text_' + Math.random().toString(36).substr(2, 9);
             const isBoldFinal = Boolean(line.isBold);
+            const fontFamilyFinal = line.fontFamily || 'system-ui, -apple-system, sans-serif';
 
-            const lineColors = samplePdfColors(line.left, line.top, line.width, line.height, pCanvas);
-            const maskObj = {
-              type: 'rect',
-              version: '5.3.0',
+            const measuredW = measureTextLineWidth(nextText, line.canvasFontSize, isBoldFinal ? 'bold' : 'normal', fontFamilyFinal);
+            const maskTop = Math.max(0, line.top - 1);
+            const maskHeight = Math.max(line.height + 2, line.canvasFontSize * 1.15);
+
+            let targetMaskWidth = Math.max(line.width, Math.ceil(measuredW + 2));
+            const maxAllowed = findContainerRightBoundary(line.left, maskTop, line.width, lineColors.bgColor, pCanvas, maskHeight);
+            if (maxAllowed > 0 && targetMaskWidth > maxAllowed) {
+              targetMaskWidth = maxAllowed;
+            }
+            const initialMaskWidth = (maxAllowed > 0 && line.width > maxAllowed) ? maxAllowed : line.width;
+            const initialWidth = Math.max(line.width + 16, Math.ceil(measuredW + 16), 40);
+
+            const tempMask = new fabric.Rect({
               left: line.left,
-              top: Math.max(0, line.top - 1),
-              width: line.width,
-              height: Math.max(line.height + 2, line.canvasFontSize * 1.15),
+              top: maskTop,
+              width: targetMaskWidth,
+              height: maskHeight,
               fill: lineColors.bgColor,
               selectable: false,
               evented: false,
               strokeWidth: 0,
-              data: { isMask: true, id: maskId, lineId: line.id, linkedTextId: textId, initialMaskWidth: line.width },
-            };
+              data: {
+                isMask: true,
+                id: maskId,
+                lineId: line.id,
+                linkedTextId: textId,
+                initialMaskWidth: initialMaskWidth,
+                initialLeft: line.left,
+                bgColor: lineColors.bgColor,
+              },
+            });
 
-            const textObj = {
-              type: 'textbox',
-              version: '5.3.0',
+            const tempTextbox = new fabric.Textbox(nextText, {
               left: line.left,
               top: line.top,
-              width: Math.max(line.width + 12, 40),
-              text: nextText,
+              width: initialWidth,
               fontSize: line.canvasFontSize,
               fill: lineColors.textColor,
               backgroundColor: 'transparent',
-              fontFamily: line.fontFamily || 'system-ui, -apple-system, sans-serif',
+              fontFamily: fontFamilyFinal,
               fontWeight: isBoldFinal ? 'bold' : 'normal',
               splitByGrapheme: true,
               editable: true,
+              hasBorders: true,
+              borderColor: '#93c5fd',
+              borderDashArray: [3, 3],
+              borderScaleFactor: 1.0,
+              padding: 0,
+              lineHeight: 1.05,
+              transparentCorners: false,
+              cornerColor: '#2563eb',
+              cornerSize: 8,
+              touchCornerSize: 14,
               data: {
                 isText: true,
                 id: textId,
@@ -2609,17 +2888,24 @@ async function executeBatchReplace() {
                 linkedMaskId: maskId,
                 originalText: line.text,
                 isBoldOriginal: isBoldFinal,
-                initialWidth: Math.max(line.width + 12, 40),
-                initialMaskWidth: line.width,
+                initialWidth: initialWidth,
+                initialMaskWidth: initialMaskWidth,
               },
-            };
+            });
+
+            const maskObj = tempMask.toObject(SERIALIZE_PROPS);
+            const textObj = tempTextbox.toObject(SERIALIZE_PROPS);
+            textObj.styles = Array.isArray(textObj.styles) ? textObj.styles : [];
 
             pObjects.push(maskObj, textObj);
             totalReplaced++;
           }
         });
 
-        state.pageStates[p].objects = pObjects;
+        state.pageStates[p] = normalizePageStateJson({
+          version: state.pageStates[p].version || '5.3.0',
+          objects: pObjects,
+        });
       }
     }
 
@@ -2723,7 +3009,7 @@ async function checkPendingDraftOnStartup() {
           showToast('正在恢复历史编辑草稿...', 'info');
           await openPdfFile(draft.pdfData, draft.fileName || '已恢复草稿.pdf', draft.password || '', draft.pageStates);
           if (draft.currentPage && draft.currentPage > 1) {
-            renderPage(draft.currentPage);
+            await renderPage(draft.currentPage);
           }
           showToast('草稿已成功恢复！您可以继续编辑', 'success');
         } catch (err) {
