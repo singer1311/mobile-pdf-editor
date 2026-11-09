@@ -370,7 +370,10 @@ async function openPdfFile(arrayBuffer, fileName = 'document.pdf', password = ''
     }
 
     updatePaginationUI();
-    await renderPage(1);
+    if (fabricCanvas) {
+      fabricCanvas.clear();
+    }
+    await renderPage(1, true);
     
     // Fit to width initially on mobile
     if (window.innerWidth < 768) {
@@ -427,19 +430,19 @@ function submitPassword() {
 // 3. Page Rendering & Fabric Overlay
 // ==========================================
 let isRendering = false;
+let isTransitioningPage = false;
 
-async function renderPage(pageNum) {
+async function renderPage(pageNum, skipSaveCurrent = false) {
   if (!state.pdfDoc || isRendering) return;
   isRendering = true;
 
   try {
-    // 1. Save current page's Fabric objects before switching
-    if (fabricCanvas && state.currentPage) {
+    // 1. Save previous page's Fabric objects BEFORE changing currentPage or clearing canvas
+    if (!skipSaveCurrent && fabricCanvas && state.currentPage) {
       saveCurrentPageState(state.currentPage);
     }
 
-    state.currentPage = pageNum;
-    updatePaginationUI();
+    isTransitioningPage = true;
 
     // 2. Fetch page from PDF.js
     const page = await state.pdfDoc.getPage(pageNum);
@@ -459,7 +462,7 @@ async function renderPage(pageNum) {
       viewport: viewport,
     }).promise;
 
-    // 4. Initialize or resize Fabric Overlay Canvas
+    // 4. Initialize or clear Fabric Overlay Canvas atomically with currentPage update
     if (!fabricCanvas) {
       fabricCanvas = new fabric.Canvas('fabric-canvas', {
         selection: true,
@@ -473,6 +476,9 @@ async function renderPage(pageNum) {
       fabricCanvas.clear();
     }
 
+    state.currentPage = pageNum;
+    updatePaginationUI();
+
     fabricCanvas.setWidth(state.baseWidth);
     fabricCanvas.setHeight(state.baseHeight);
 
@@ -483,11 +489,14 @@ async function renderPage(pageNum) {
       await new Promise(resolve => {
         fabricCanvas.loadFromJSON(normalizedState, () => {
           sanitizeFabricCanvasObjects(fabricCanvas);
+          isTransitioningPage = false;
           sanitizeMaskColors();
           fabricCanvas.renderAll();
           resolve();
         });
       });
+    } else {
+      isTransitioningPage = false;
     }
 
     // 5.1 Pre-extract and cache text lines for smart Word-like click editing
@@ -509,12 +518,13 @@ async function renderPage(pageNum) {
     console.error('Error rendering page:', err);
     showToast('页面渲染失败: ' + err.message, 'error');
   } finally {
+    isTransitioningPage = false;
     isRendering = false;
   }
 }
 
 function saveCurrentPageState(pageNum) {
-  if (!fabricCanvas) return;
+  if (!fabricCanvas || isTransitioningPage) return;
   const p = pageNum || state.currentPage;
   sanitizeFabricCanvasObjects(fabricCanvas);
   const json = fabricCanvas.toJSON(SERIALIZE_PROPS);
@@ -1972,7 +1982,7 @@ async function exportModifiedPdf() {
 
 // Generates transparent overlay PNG for a single page
 async function generatePageOverlayPng(pageNum) {
-  const rawState = (pageNum === state.currentPage && fabricCanvas)
+  const rawState = (pageNum === state.currentPage && fabricCanvas && !isTransitioningPage)
     ? (() => { sanitizeFabricCanvasObjects(fabricCanvas); return fabricCanvas.toJSON(SERIALIZE_PROPS); })()
     : state.pageStates[pageNum];
 
@@ -2019,7 +2029,7 @@ async function renderDecryptedPageComposite(pageNum) {
   await page.render({ canvasContext: ctx, viewport: renderViewport }).promise;
 
   // 2. Render fabric modifications on top
-  const rawState = (pageNum === state.currentPage && fabricCanvas)
+  const rawState = (pageNum === state.currentPage && fabricCanvas && !isTransitioningPage)
     ? (() => { sanitizeFabricCanvasObjects(fabricCanvas); return fabricCanvas.toJSON(SERIALIZE_PROPS); })()
     : state.pageStates[pageNum];
 
