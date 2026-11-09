@@ -1770,21 +1770,22 @@ async function exportModifiedPdf() {
 
 // Generates transparent overlay PNG for a single page
 async function generatePageOverlayPng(pageNum) {
-  if (pageNum === state.currentPage && fabricCanvas) {
-    if (fabricCanvas.getObjects().length === 0) return null;
-    return fabricCanvas.toDataURL({ format: 'png', multiplier: 1 });
-  }
+  const jsonState = (pageNum === state.currentPage && fabricCanvas) 
+    ? fabricCanvas.toJSON(['data', 'isMask', 'isText']) 
+    : state.pageStates[pageNum];
 
-  const jsonState = state.pageStates[pageNum];
   if (!jsonState || !jsonState.objects || jsonState.objects.length === 0) {
     return null;
   }
 
   return new Promise(resolve => {
     const tempCanvas = document.createElement('canvas');
-    const staticCanvas = new fabric.StaticCanvas(tempCanvas);
+    const staticCanvas = new fabric.StaticCanvas(tempCanvas, {
+      enableRetinaScaling: false
+    });
     staticCanvas.setWidth(state.baseWidth);
     staticCanvas.setHeight(state.baseHeight);
+    staticCanvas.setZoom(1.0);
 
     staticCanvas.loadFromJSON(jsonState, () => {
       staticCanvas.renderAll();
@@ -1817,14 +1818,16 @@ async function renderDecryptedPageComposite(pageNum) {
   if (jsonState && jsonState.objects && jsonState.objects.length > 0) {
     await new Promise(resolve => {
       const fabricOffscreen = document.createElement('canvas');
-      const staticCanvas = new fabric.StaticCanvas(fabricOffscreen);
+      const staticCanvas = new fabric.StaticCanvas(fabricOffscreen, {
+        enableRetinaScaling: false
+      });
       staticCanvas.setWidth(renderViewport.width);
       staticCanvas.setHeight(renderViewport.height);
       staticCanvas.setZoom(2.0 / state.baseScale);
 
       staticCanvas.loadFromJSON(jsonState, () => {
         staticCanvas.renderAll();
-        ctx.drawImage(fabricOffscreen, 0, 0);
+        ctx.drawImage(fabricOffscreen, 0, 0, renderViewport.width, renderViewport.height);
         staticCanvas.dispose();
         resolve();
       });
