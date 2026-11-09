@@ -120,6 +120,8 @@ const elements = {
   btnFontPlus: document.getElementById('btn-font-plus'),
   inputTextColor: document.getElementById('input-text-color'),
   btnTextBold: document.getElementById('btn-text-bold'),
+  textBgPropControls: document.getElementById('text-bg-prop-controls'),
+  inputTextBgColor: document.getElementById('input-text-bg-color'),
   inputMaskColor: document.getElementById('input-mask-color'),
   brushWidthSlider: document.getElementById('brush-width-slider'),
   btnDeleteSelected: document.getElementById('btn-delete-selected'),
@@ -394,6 +396,7 @@ async function renderPage(pageNum) {
     if (state.pageStates[pageNum]) {
       await new Promise(resolve => {
         fabricCanvas.loadFromJSON(state.pageStates[pageNum], () => {
+          sanitizeMaskColors();
           fabricCanvas.renderAll();
           resolve();
         });
@@ -1242,9 +1245,9 @@ async function extractPageTextLines(page, viewport) {
 }
 
 // Smart interior mode sampling: immune to borders, lines, and adjacent elements
-function samplePdfColors(left, top, width, height) {
+function samplePdfColors(left, top, width, height, sourceCanvas = null) {
   try {
-    const pdfCanvas = elements.pdfCanvas;
+    const pdfCanvas = sourceCanvas || elements.pdfCanvas;
     if (!pdfCanvas) return { bgColor: '#ffffff', textColor: '#111827' };
     const ctx = pdfCanvas.getContext('2d', { willReadFrequently: true });
 
@@ -1255,7 +1258,7 @@ function samplePdfColors(left, top, width, height) {
 
     if (w <= 0 || h <= 0) return { bgColor: '#ffffff', textColor: '#111827' };
 
-    // 1. Interior mode sampling: characters take ~15-25% of area; background is the dominant mode (众数)
+    // 1. Interior mode sampling: characters take ~15-25% of area; background is the dominant mode
     // Sample strictly INSIDE the text box to avoid grabbing outside borders or lines
     const imgData = ctx.getImageData(l, t, w, h).data;
     const colorHistogram = new Map();
@@ -1268,26 +1271,39 @@ function samplePdfColors(left, top, width, height) {
       const a = imgData[i + 3];
       if (a < 80) continue;
 
-      // 8-level buckets to preserve subtle pastel tints (e.g. light blue #e8f3fb from white)
-      const qr = Math.round(r / 8) * 8;
-      const qg = Math.round(g / 8) * 8;
-      const qb = Math.round(b / 8) * 8;
+      // 8-level buckets to group subtle noise, strictly clamped to [0, 255]
+      const qr = Math.min(255, Math.max(0, Math.round(r / 8) * 8));
+      const qg = Math.min(255, Math.max(0, Math.round(g / 8) * 8));
+      const qb = Math.min(255, Math.max(0, Math.round(b / 8) * 8));
       const key = `${qr},${qg},${qb}`;
 
-      colorHistogram.set(key, (colorHistogram.get(key) || 0) + 1);
+      const entry = colorHistogram.get(key) || { count: 0, sumR: 0, sumG: 0, sumB: 0 };
+      entry.count++;
+      entry.sumR += r;
+      entry.sumG += g;
+      entry.sumB += b;
+      colorHistogram.set(key, entry);
     }
 
     // Find dominant color bucket (mode)
+    let dominantEntry = null;
     let maxCount = 0;
-    let dominantKey = '255,255,255';
-    for (const [key, count] of colorHistogram.entries()) {
-      if (count > maxCount) {
-        maxCount = count;
-        dominantKey = key;
+    for (const entry of colorHistogram.values()) {
+      if (entry.count > maxCount) {
+        maxCount = entry.count;
+        dominantEntry = entry;
       }
     }
-    const [dr, dg, db] = dominantKey.split(',').map(Number);
-    let bg = { r: dr, g: dg, b: db };
+
+    // Authentic average RGB of the dominant bucket (preserves exact authentic tint without quantization steps)
+    let bg = { r: 255, g: 255, b: 255 };
+    if (dominantEntry && dominantEntry.count > 0) {
+      bg = {
+        r: Math.round(dominantEntry.sumR / dominantEntry.count),
+        g: Math.round(dominantEntry.sumG / dominantEntry.count),
+        b: Math.round(dominantEntry.sumB / dominantEntry.count),
+      };
+    }
 
     // Snap to pure neutral white ONLY if all channels are >= 248 and almost equal (neutral paper scan noise)
     // NEVER snap tinted backgrounds (like light blue #e8f3fb, light gray, pastel) to white!
@@ -1335,7 +1351,10 @@ function samplePdfColors(left, top, width, height) {
       text = { r: 255, g: 255, b: 255 }; // Force white ink on dark background
     }
 
-    const toHex = (c) => `#${((1 << 24) + (c.r << 16) + (c.g << 8) + c.b).toString(16).slice(1)}`;
+    // Bulletproof hex formatter: clamps to [0, 255] and pads 2 digits (zero bit-shift overflow risk)
+    const clamp = (v) => Math.max(0, Math.min(255, Math.round(v || 0)));
+    const toHex = (c) => `#${clamp(c.r).toString(16).padStart(2, '0')}${clamp(c.g).toString(16).padStart(2, '0')}${clamp(c.b).toString(16).padStart(2, '0')}`;
+
     return {
       bgColor: toHex(bg),
       textColor: toHex(text),
@@ -1346,8 +1365,26 @@ function samplePdfColors(left, top, width, height) {
   }
 }
 
-function samplePdfBackgroundColor(left, top, width, height) {
-  return samplePdfColors(left, top, width, height).bgColor;
+// Auto-heals any legacy bugged yellow/lime masks from older drafts or sessions
+function sanitizeMaskColors() {
+  if (!fabricCanvas) return;
+  let modified = false;
+  fabricCanvas.getObjects().forEach(o => {
+    if (o.data?.isMask && (o.fill === '#e0f900' || o.fill === '#e4f850' || o.fill === '#e0f800')) {
+      const trueColors = samplePdfColors(o.left, o.top, o.width, o.height);
+      o.set('fill', trueColors.bgColor);
+      if (o.data) o.data.bgColor = trueColors.bgColor;
+      modified = true;
+    }
+  });
+  if (modified) {
+    fabricCanvas.requestRenderAll();
+    saveCurrentPageState(state.currentPage);
+  }
+}
+
+function samplePdfBackgroundColor(left, top, width, height, sourceCanvas = null) {
+  return samplePdfColors(left, top, width, height, sourceCanvas).bgColor;
 }
 
 // ==========================================
@@ -1371,6 +1408,18 @@ function updatePropertyBar() {
       elements.btnTextBold.className = (activeObj.fontWeight === 'bold')
         ? 'w-6 h-6 rounded bg-blue-600 text-white flex items-center justify-center font-bold text-xs'
         : 'w-6 h-6 rounded bg-slate-800 hover:bg-slate-700 flex items-center justify-center font-bold text-xs';
+
+      if (activeObj.data?.linkedMaskId) {
+        const mask = fabricCanvas.getObjects().find(o => o.data?.id === activeObj.data.linkedMaskId);
+        if (mask && elements.textBgPropControls && elements.inputTextBgColor) {
+          elements.textBgPropControls.classList.remove('hidden');
+          elements.textBgPropControls.classList.add('flex');
+          elements.inputTextBgColor.value = mask.fill || '#ffffff';
+        }
+      } else if (elements.textBgPropControls) {
+        elements.textBgPropControls.classList.add('hidden');
+        elements.textBgPropControls.classList.remove('flex');
+      }
     } else if (activeObj.data?.isMask || activeObj.type === 'rect') {
       elements.maskPropControls.classList.remove('hidden');
       elements.maskPropControls.classList.add('flex');
@@ -2123,6 +2172,20 @@ function setupEventListeners() {
       saveCurrentPageState(state.currentPage);
     }
   });
+  if (elements.inputTextBgColor) {
+    elements.inputTextBgColor.addEventListener('input', (e) => {
+      const activeObj = fabricCanvas?.getActiveObject();
+      if (activeObj && activeObj.data?.linkedMaskId) {
+        const mask = fabricCanvas.getObjects().find(o => o.data?.id === activeObj.data.linkedMaskId);
+        if (mask) {
+          mask.set('fill', e.target.value);
+          if (mask.data) mask.data.bgColor = e.target.value;
+          fabricCanvas.requestRenderAll();
+          saveCurrentPageState(state.currentPage);
+        }
+      }
+    });
+  }
   document.querySelectorAll('.text-color-swatch').forEach(btn => {
     btn.addEventListener('click', () => {
       const color = btn.dataset.color;
@@ -2482,6 +2545,22 @@ async function executeBatchReplace() {
           }
         });
 
+        const hasUnconvertedMatches = pLines.some(line => !pConvertedLineIds.has(line.id) && (exact ? (line.text.trim() === findStr) : line.text.includes(findStr)));
+        let pCanvas = null;
+        if (hasUnconvertedMatches) {
+          try {
+            const page = await state.pdfDoc.getPage(p);
+            const viewport = page.getViewport({ scale: state.baseScale });
+            pCanvas = document.createElement('canvas');
+            pCanvas.width = viewport.width;
+            pCanvas.height = viewport.height;
+            const pCtx = pCanvas.getContext('2d', { willReadFrequently: true });
+            await page.render({ canvasContext: pCtx, viewport }).promise;
+          } catch (e) {
+            console.warn(`Render page ${p} for color sampling failed:`, e);
+          }
+        }
+
         pLines.forEach(line => {
           if (pConvertedLineIds.has(line.id)) return;
           const matched = exact ? (line.text.trim() === findStr) : line.text.includes(findStr);
@@ -2491,7 +2570,7 @@ async function executeBatchReplace() {
             const textId = 'text_' + Math.random().toString(36).substr(2, 9);
             const isBoldFinal = Boolean(line.isBold);
 
-            const lineColors = samplePdfColors(line.left, line.top, line.width, line.height);
+            const lineColors = samplePdfColors(line.left, line.top, line.width, line.height, pCanvas);
             const maskObj = {
               type: 'rect',
               version: '5.3.0',
