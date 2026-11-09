@@ -2684,6 +2684,7 @@ function saveDraftToStorage() {
         id: 'active_draft',
         fileName: state.fileName,
         pdfData: state.pdfData,
+        password: state.password || '',
         pageStates: state.pageStates,
         currentPage: state.currentPage,
         timestamp: Date.now(),
@@ -2717,7 +2718,7 @@ async function checkPendingDraftOnStartup() {
         try {
           elements.draftRecoveryBanner.classList.add('hidden');
           showToast('正在恢复历史编辑草稿...', 'info');
-          await openPdfFile(draft.pdfData, draft.fileName || '已恢复草稿.pdf', '', draft.pageStates);
+          await openPdfFile(draft.pdfData, draft.fileName || '已恢复草稿.pdf', draft.password || '', draft.pageStates);
           if (draft.currentPage && draft.currentPage > 1) {
             renderPage(draft.currentPage);
           }
