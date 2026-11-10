@@ -37,11 +37,13 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/fabric.js/5.3.1/fabric.min.js"></script>
   <!-- pdf-lib -->
   <script src="https://unpkg.com/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+  <!-- Tesseract.js OCR Engine (Pure Client-Side Scanned Image Recognition) -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
   <!-- canvas-confetti -->
   <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.2/dist/confetti.browser.min.js"></script>
 
   <!-- Custom Stylesheet -->
-  <link rel="stylesheet" href="style.css?v=20261109v3">
+  <link rel="stylesheet" href="style.css?v=20261110v4">
 </head>
 <body class="bg-slate-100 text-slate-800 antialiased select-none overflow-hidden h-screen flex flex-col font-sans">
 
@@ -73,13 +75,20 @@
 
     <!-- Right Controls: Mode Toggle & Export -->
     <div class="flex items-center space-x-1.5 sm:space-x-2">
-      <!-- Hidden file input -->
-      <input type="file" id="pdf-file-input" accept="application/pdf" class="hidden">
+      <!-- Hidden file input (supports PDF + Scanned Images JPG/PNG/WEBP) -->
+      <input type="file" id="pdf-file-input" accept="application/pdf,image/jpeg,image/png,image/webp" class="hidden">
       
-      <!-- Open PDF Button -->
-      <button id="btn-open-pdf" class="px-2.5 sm:px-3 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 active:bg-slate-300 rounded-lg flex items-center space-x-1.5 transition">
+      <!-- Open PDF / Image Button -->
+      <button id="btn-open-pdf" class="px-2.5 sm:px-3 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 active:bg-slate-300 rounded-lg flex items-center space-x-1.5 transition" title="打开 PDF 文件或扫描图片 (JPG/PNG)">
         <i class="fa-solid fa-folder-open text-blue-600"></i>
         <span class="hidden sm:inline">打开</span>
+      </button>
+
+      <!-- OCR Scanned Image Recognition Button -->
+      <button id="btn-ocr-page" class="hidden px-2.5 sm:px-3 py-1.5 text-xs font-semibold text-amber-700 bg-amber-50 hover:bg-amber-100 active:bg-amber-200 border border-amber-300 rounded-lg flex items-center space-x-1.5 shadow-sm transition" title="OCR 扫描件智能识字：识别纯图片/扫描件中的文字，支持直接点击无痕改字与一键替换">
+        <i class="fa-solid fa-eye text-amber-600"></i>
+        <span class="hidden sm:inline">扫描识字</span>
+        <span class="sm:hidden">OCR</span>
       </button>
 
       <!-- Word Mode One-Click Button -->
@@ -149,11 +158,32 @@
   <div id="smart-edit-tip-banner" class="hidden bg-gradient-to-r from-blue-600 via-indigo-600 to-emerald-600 text-white px-3 py-1.5 text-xs flex items-center justify-between shadow-sm z-20 shrink-0">
     <div class="flex items-center space-x-2 truncate">
       <span class="bg-white/20 px-1.5 py-0.5 rounded text-[10px] font-bold shrink-0">Word模式</span>
-      <span class="truncate">💡 提示：点击 PDF 上的任意文字即可直接改字；或点击顶部「一键转Word」全文变文本框！</span>
+      <span class="truncate">💡 提示：点击任意文字即可直接改字；扫描件可点顶部「扫描识字」或用底部「框选改字」无痕修改！</span>
     </div>
     <button id="btn-close-tip-banner" class="text-white/80 hover:text-white ml-2 text-sm px-1 shrink-0" title="关闭提示">
       <i class="fa-solid fa-xmark"></i>
     </button>
+  </div>
+
+  <!-- Scanned Image Detected / OCR Quick Action Banner -->
+  <div id="scan-detected-banner" class="hidden bg-gradient-to-r from-amber-600 via-orange-600 to-amber-600 text-white px-3 py-1.5 text-xs flex flex-wrap items-center justify-between gap-2 shadow-sm z-20 shrink-0">
+    <div class="flex items-center space-x-2 min-w-0">
+      <span class="bg-white/25 px-1.5 py-0.5 rounded text-[10px] font-bold shrink-0">扫描件无痕模式</span>
+      <span id="scan-banner-text" class="truncate">检测到本页为纯扫描图片！已自动开启「纸张纹理无痕修复」，可一键 OCR 识字或直接用「框选改字」：</span>
+    </div>
+    <div class="flex items-center space-x-1.5 shrink-0">
+      <button id="btn-ocr-fast-eng" class="px-2.5 py-1 bg-white text-amber-800 font-bold rounded shadow-sm hover:bg-amber-50 active:scale-95 transition text-[11px] flex items-center space-x-1" title="极速识别英文、数字、账单、日期与金额">
+        <i class="fa-solid fa-bolt text-amber-600"></i>
+        <span>识别英文/数字账单</span>
+      </button>
+      <button id="btn-ocr-chi-eng" class="px-2.5 py-1 bg-amber-900/70 hover:bg-amber-900 text-white font-semibold rounded shadow-sm active:scale-95 transition text-[11px] flex items-center space-x-1" title="识别中文+英文混合扫描文档">
+        <i class="fa-solid fa-language"></i>
+        <span>识别中英混合</span>
+      </button>
+      <button id="btn-close-scan-banner" class="text-white/80 hover:text-white ml-1 text-sm px-1" title="关闭提示">
+        <i class="fa-solid fa-xmark"></i>
+      </button>
+    </div>
   </div>
 
   <!-- Floating Quick Zoom HUD (Top Right, Mobile Optimized) -->
@@ -192,7 +222,7 @@
       <!-- Upload Button Trigger -->
       <button id="btn-dropzone-upload" class="w-full py-3.5 px-4 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white font-semibold rounded-xl shadow-lg shadow-blue-500/25 active:scale-[0.98] transition flex items-center justify-center space-x-2 mb-4">
         <i class="fa-solid fa-arrow-up-from-bracket"></i>
-        <span>选择本地 PDF 文件</span>
+        <span>选择 PDF 文件 或 扫描图片 (JPG/PNG)</span>
       </button>
 
       <!-- Quick Demo Cards -->
@@ -262,7 +292,13 @@
       <!-- Linked Mask / Background Color -->
       <div id="text-bg-prop-controls" class="hidden items-center space-x-1">
         <span class="text-slate-400 text-[11px]">底色:</span>
-        <input type="color" id="input-text-bg-color" class="w-5 h-5 rounded-full bg-transparent border-0 cursor-pointer p-0" title="自选底色遮罩" value="#ffffff">
+        <input type="color" id="input-text-bg-color" class="w-5 h-5 rounded-full bg-transparent border-0 cursor-pointer p-0" title="自选纯色底色遮罩" value="#ffffff">
+        <button id="btn-restore-seamless-mask" class="px-1.5 py-0.5 rounded bg-emerald-600/80 hover:bg-emerald-500 text-white text-[10px] font-medium transition" title="恢复纸张纹理无痕融合底色（自动消除色块痕迹）">
+          无痕底纹
+        </button>
+        <button id="btn-toggle-scan-blend" class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-[10px] font-medium transition" title="切换扫描件墨迹边缘柔化效果，让新字融入扫描纸张">
+          墨迹柔化
+        </button>
         <div class="h-3.5 w-px bg-slate-700 mx-1"></div>
       </div>
 
@@ -326,6 +362,14 @@
           <i class="fa-solid fa-wand-magic-sparkles"></i>
         </div>
         <span class="text-[10px] font-medium leading-none">一键转Word</span>
+      </button>
+
+      <!-- Tool: OCR Scanned Page -->
+      <button id="tool-ocr-page" class="toolbar-btn flex flex-col items-center justify-center min-w-[56px] py-1 px-1.5 rounded-xl transition text-amber-600 hover:text-amber-700" title="扫描件OCR识字：识别纯图片/扫描件文字并无痕修改">
+        <div class="w-8 h-8 rounded-full flex items-center justify-center text-sm mb-0.5 tool-icon-bg bg-amber-50 text-amber-600">
+          <i class="fa-solid fa-eye"></i>
+        </div>
+        <span class="text-[10px] font-medium leading-none">扫描识字</span>
       </button>
 
       <!-- Tool: Batch Replace -->
@@ -670,6 +714,6 @@
   </div>
 
   <!-- Application Logic -->
-  <script src="app.js?v=20261109v3"></script>
+  <script src="app.js?v=20261110v4"></script>
 </body>
 </html>

@@ -28,6 +28,8 @@ const state = {
   pageStates: {},
   pageTextLines: {},
   historyStack: {},
+  isScannedPage: {},
+  isImageSource: false,
 
   // Drawing & Tools state
   isDrawingBox: false,
@@ -67,6 +69,8 @@ const SERIALIZE_PROPS = [
   'evented',
   'editable',
   'padding',
+  'shadow',
+  'opacity',
   'borderColor',
   'borderDashArray',
   'borderScaleFactor',
@@ -75,6 +79,273 @@ const SERIALIZE_PROPS = [
   'touchCornerSize',
   'transparentCorners',
 ];
+
+// Override fabric.Rect._render so masks with a generated paper-texture patch (_patchCanvas) draw seamlessly
+const _origFabricRectRender = fabric.Rect.prototype._render;
+fabric.Rect.prototype._render = function (ctx) {
+  if (this.data?.isMask && !this.data?.customSolidColor && this._patchCanvas) {
+    ctx.save();
+    ctx.drawImage(
+      this._patchCanvas,
+      -this.width / 2,
+      -this.height / 2,
+      this.width,
+      this.height
+    );
+    ctx.restore();
+    return;
+  }
+  _origFabricRectRender.call(this, ctx);
+};
+
+// Parse #rrggbb or #rgb hex into { r, g, b }
+function parseHexRgb(hexStr, fallback = { r: 255, g: 255, b: 255 }) {
+  if (!hexStr || typeof hexStr !== 'string' || !hexStr.startsWith('#')) return fallback;
+  const h = hexStr.slice(1);
+  if (h.length === 3) {
+    return {
+      r: parseInt(h[0] + h[0], 16) || 0,
+      g: parseInt(h[1] + h[1], 16) || 0,
+      b: parseInt(h[2] + h[2], 16) || 0,
+    };
+  }
+  if (h.length >= 6) {
+    return {
+      r: parseInt(h.slice(0, 2), 16) || 0,
+      g: parseInt(h.slice(2, 4), 16) || 0,
+      b: parseInt(h.slice(4, 6), 16) || 0,
+    };
+  }
+  return fallback;
+}
+
+// Builds a seamless paper-texture & lighting-gradient inpainted patch for a mask Rect
+function buildMaskSeamlessPatch(maskObj, sourcePdfCanvas = null, coordScale = 1.0) {
+  try {
+    if (!maskObj || !maskObj.data?.isMask) return;
+    if (maskObj.data?.customSolidColor) {
+      maskObj._patchCanvas = null;
+      return;
+    }
+    const pdfCanvas = sourcePdfCanvas || elements.pdfCanvas;
+    if (!pdfCanvas || pdfCanvas.width <= 0 || pdfCanvas.height <= 0) return;
+
+    const sx = Math.max(0, Math.floor((maskObj.left || 0) * coordScale));
+    const sy = Math.max(0, Math.floor((maskObj.top || 0) * coordScale));
+    const sw = Math.min(pdfCanvas.width - sx, Math.max(1, Math.ceil((maskObj.width || 1) * coordScale)));
+    const sh = Math.min(pdfCanvas.height - sy, Math.max(1, Math.ceil((maskObj.height || 1) * coordScale)));
+    if (sw <= 1 || sh <= 1) return;
+
+    const pad = 2;
+    const bx = Math.max(0, sx - pad);
+    const by = Math.max(0, sy - pad);
+    const bw = Math.min(pdfCanvas.width - bx, sw + pad * 2);
+    const bh = Math.min(pdfCanvas.height - by, sh + pad * 2);
+
+    const ctx = pdfCanvas.getContext('2d', { willReadFrequently: true });
+    const srcData = ctx.getImageData(bx, by, bw, bh).data;
+    const baseRgb = parseHexRgb(maskObj.fill || maskObj.data?.bgColor || '#ffffff');
+
+    // Measure background variance & horizontal lighting gradient on non-ink pixels
+    let sumDiffSq = 0;
+    let bgCount = 0;
+    let leftSumR = 0, leftSumG = 0, leftSumB = 0, leftCnt = 0;
+    let rightSumR = 0, rightSumG = 0, rightSumB = 0, rightCnt = 0;
+
+    for (let y = 0; y < bh; y += 2) {
+      for (let x = 0; x < bw; x += 2) {
+        const idx = (y * bw + x) * 4;
+        if (srcData[idx + 3] < 80) continue;
+        const r = srcData[idx];
+        const g = srcData[idx + 1];
+        const b = srcData[idx + 2];
+        const dist = Math.abs(r - baseRgb.r) + Math.abs(g - baseRgb.g) + Math.abs(b - baseRgb.b);
+        if (dist <= 44) {
+          const avgDiff = dist / 3;
+          sumDiffSq += avgDiff * avgDiff;
+          bgCount++;
+          if (x < bw * 0.35) {
+            leftSumR += r; leftSumG += g; leftSumB += b; leftCnt++;
+          } else if (x > bw * 0.65) {
+            rightSumR += r; rightSumG += g; rightSumB += b; rightCnt++;
+          }
+        }
+      }
+    }
+
+    const bgStdDev = bgCount > 4 ? Math.sqrt(sumDiffSq / bgCount) : 0;
+    let leftRightDiff = 0;
+    if (leftCnt > 0 && rightCnt > 0) {
+      leftRightDiff =
+        Math.abs(leftSumR / leftCnt - rightSumR / rightCnt) +
+        Math.abs(leftSumG / leftCnt - rightSumG / rightCnt) +
+        Math.abs(leftSumB / leftCnt - rightSumB / rightCnt);
+    }
+
+    // Fast path: if pure uniform digital background (< 0.85 stdDev and < 2.0 gradient), flat fill is already 100% exact
+    if (bgStdDev < 0.85 && leftRightDiff < 2.0 && !state.isScannedPage[state.currentPage]) {
+      maskObj._patchCanvas = null;
+      return;
+    }
+
+    // Scanned / Textured / Shadowed background: build column-profiled top & bottom background arrays
+    const rawTopBg = new Array(sw);
+    const rawBotBg = new Array(sw);
+    const ox = sx - bx;
+    const oy = sy - by;
+
+    for (let x = 0; x < sw; x++) {
+      let tr = 0, tg = 0, tb = 0, tc = 0;
+      let br = 0, bg = 0, bb = 0, bc = 0;
+      const xStart = Math.max(0, ox + x - 3);
+      const xEnd = Math.min(bw - 1, ox + x + 3);
+
+      // Sample top rim rows
+      for (let ry = 0; ry < Math.min(bh, oy + Math.max(3, Math.floor(sh * 0.35))); ry++) {
+        for (let rx = xStart; rx <= xEnd; rx += 2) {
+          const idx = (ry * bw + rx) * 4;
+          const r = srcData[idx], g = srcData[idx + 1], b = srcData[idx + 2];
+          if (Math.abs(r - baseRgb.r) + Math.abs(g - baseRgb.g) + Math.abs(b - baseRgb.b) <= 42) {
+            tr += r; tg += g; tb += b; tc++;
+          }
+        }
+        if (tc >= 6 && ry >= oy + 1) break;
+      }
+
+      // Sample bottom rim rows
+      for (let ry = bh - 1; ry >= Math.max(0, oy + Math.floor(sh * 0.65)); ry--) {
+        for (let rx = xStart; rx <= xEnd; rx += 2) {
+          const idx = (ry * bw + rx) * 4;
+          const r = srcData[idx], g = srcData[idx + 1], b = srcData[idx + 2];
+          if (Math.abs(r - baseRgb.r) + Math.abs(g - baseRgb.g) + Math.abs(b - baseRgb.b) <= 42) {
+            br += r; bg += g; bb += b; bc++;
+          }
+        }
+        if (bc >= 6 && ry <= oy + sh - 1) break;
+      }
+
+      rawTopBg[x] = tc > 0 ? { r: tr / tc, g: tg / tc, b: tb / tc } : { ...baseRgb };
+      rawBotBg[x] = bc > 0 ? { r: br / bc, g: bg / bc, b: bb / bc } : { ...rawTopBg[x] };
+    }
+
+    // Smooth column profiles horizontally with a 9-px moving average to eliminate any vertical banding
+    const topBg = new Array(sw);
+    const botBg = new Array(sw);
+    for (let x = 0; x < sw; x++) {
+      let tr = 0, tg = 0, tb = 0, br = 0, bg = 0, bb = 0, cnt = 0;
+      for (let k = Math.max(0, x - 4); k <= Math.min(sw - 1, x + 4); k++) {
+        tr += rawTopBg[k].r; tg += rawTopBg[k].g; tb += rawTopBg[k].b;
+        br += rawBotBg[k].r; bg += rawBotBg[k].g; bb += rawBotBg[k].b;
+        cnt++;
+      }
+      topBg[x] = { r: tr / cnt, g: tg / cnt, b: tb / cnt };
+      botBg[x] = { r: br / cnt, g: bg / cnt, b: bb / cnt };
+    }
+
+    const patchCanvas = document.createElement('canvas');
+    patchCanvas.width = sw;
+    patchCanvas.height = sh;
+    const patchCtx = patchCanvas.getContext('2d');
+    const outImg = patchCtx.createImageData(sw, sh);
+    const out = outImg.data;
+    const grainAmp = Math.min(5.5, Math.max(0.8, bgStdDev * 1.15));
+
+    const isPixelCleanPaper = (px, py, expR, expG, expB) => {
+      const idx = (py * bw + px) * 4;
+      const dist = Math.abs(srcData[idx] - expR) + Math.abs(srcData[idx + 1] - expG) + Math.abs(srcData[idx + 2] - expB);
+      return dist <= 20;
+    };
+
+    for (let y = 0; y < sh; y++) {
+      const tY = sh > 1 ? (y / (sh - 1)) : 0.5;
+      const py = Math.min(bh - 1, oy + y);
+      for (let x = 0; x < sw; x++) {
+        const px = Math.min(bw - 1, ox + x);
+        const expR = topBg[x].r * (1 - tY) + botBg[x].r * tY;
+        const expG = topBg[x].g * (1 - tY) + botBg[x].g * tY;
+        const expB = topBg[x].b * (1 - tY) + botBg[x].b * tY;
+
+        const srcIdx = (py * bw + px) * 4;
+        const origR = srcData[srcIdx];
+        const origG = srcData[srcIdx + 1];
+        const origB = srcData[srcIdx + 2];
+        const origDist = Math.abs(origR - expR) + Math.abs(origG - expG) + Math.abs(origB - expB);
+
+        let finalR, finalG, finalB;
+        // If this pixel and its immediate neighbors have no ink (pure original paper), keep real scan texture!
+        if (
+          origDist <= 18 &&
+          isPixelCleanPaper(Math.max(0, px - 1), py, expR, expG, expB) &&
+          isPixelCleanPaper(Math.min(bw - 1, px + 1), py, expR, expG, expB) &&
+          isPixelCleanPaper(px, Math.max(0, py - 1), expR, expG, expB) &&
+          isPixelCleanPaper(px, Math.min(bh - 1, py + 1), expR, expG, expB)
+        ) {
+          finalR = origR;
+          finalG = origG;
+          finalB = origB;
+        } else {
+          // Deterministic 2D paper grain matching local scan noise
+          const hash = (((sx + x) * 73856093) ^ ((sy + y) * 19349663)) & 0xff;
+          const grain = ((hash / 255) - 0.5) * 2 * grainAmp;
+          finalR = Math.max(0, Math.min(255, Math.round(expR + grain)));
+          finalG = Math.max(0, Math.min(255, Math.round(expG + grain)));
+          finalB = Math.max(0, Math.min(255, Math.round(expB + grain)));
+        }
+
+        // Soft 1px outer rim feathering where there is no dark ink on the boundary
+        let alpha = 255;
+        if ((x === 0 || x === sw - 1 || y === 0 || y === sh - 1) && origDist <= 34) {
+          alpha = 185;
+        }
+
+        const outIdx = (y * sw + x) * 4;
+        out[outIdx] = finalR;
+        out[outIdx + 1] = finalG;
+        out[outIdx + 2] = finalB;
+        out[outIdx + 3] = alpha;
+      }
+    }
+
+    patchCtx.putImageData(outImg, 0, 0);
+    maskObj._patchCanvas = patchCanvas;
+  } catch (err) {
+    console.warn('buildMaskSeamlessPatch warning:', err);
+  }
+}
+
+function prepareSeamlessMasksForCanvas(targetCanvas, sourcePdfCanvas = null, coordScale = 1.0) {
+  if (!targetCanvas || typeof targetCanvas.getObjects !== 'function') return;
+  const pdfCanvas = sourcePdfCanvas || elements.pdfCanvas;
+  if (!pdfCanvas) return;
+  targetCanvas.getObjects().forEach(o => {
+    if (o.data?.isMask) {
+      buildMaskSeamlessPatch(o, pdfCanvas, coordScale);
+    }
+  });
+}
+
+// Toggle subtle scan-ink optical blend on a Textbox so new text matches scanned ink softness
+function applyScanInkBlend(textbox, enable = true) {
+  if (!textbox) return;
+  if (!textbox.data) textbox.data = {};
+  textbox.data.scanBlend = Boolean(enable);
+  if (enable) {
+    textbox.set({
+      opacity: 0.94,
+      shadow: new fabric.Shadow({
+        color: textbox.fill || '#1f2937',
+        blur: 0.45,
+        offsetX: 0,
+        offsetY: 0,
+      }),
+    });
+  } else {
+    textbox.set({
+      opacity: 1.0,
+      shadow: null,
+    });
+  }
+}
 
 let _measureCanvas = null;
 function measureTextLineWidth(text, fontSize = 16, fontWeight = 'normal', fontFamily = 'system-ui, -apple-system, sans-serif') {
@@ -159,6 +430,15 @@ const elements = {
   btnPrevPage: document.getElementById('btn-prev-page'),
   btnNextPage: document.getElementById('btn-next-page'),
   btnOpenPdf: document.getElementById('btn-open-pdf'),
+  btnOcrPage: document.getElementById('btn-ocr-page'),
+  toolOcrPage: document.getElementById('tool-ocr-page'),
+  scanDetectedBanner: document.getElementById('scan-detected-banner'),
+  scanBannerText: document.getElementById('scan-banner-text'),
+  btnOcrFastEng: document.getElementById('btn-ocr-fast-eng'),
+  btnOcrChiEng: document.getElementById('btn-ocr-chi-eng'),
+  btnCloseScanBanner: document.getElementById('btn-close-scan-banner'),
+  btnRestoreSeamlessMask: document.getElementById('btn-restore-seamless-mask'),
+  btnToggleScanBlend: document.getElementById('btn-toggle-scan-blend'),
   btnConvertAllText: document.getElementById('btn-convert-all-text'),
   btnBatchReplace: document.getElementById('btn-batch-replace'),
   toolBatchReplace: document.getElementById('tool-batch-replace'),
@@ -310,12 +590,15 @@ function showToast(message, type = 'info') {
 // ==========================================
 // 2. PDF Loading & Password Handling
 // ==========================================
-async function openPdfFile(arrayBuffer, fileName = 'document.pdf', password = '', initialPageStates = null) {
+async function openPdfFile(arrayBuffer, fileName = 'document.pdf', password = '', initialPageStates = null, isImageSource = false) {
   // Clone ArrayBuffer to avoid detachment by PDF.js worker transfer
   state.pdfData = arrayBuffer.slice(0);
   state.fileName = fileName;
   state.password = password;
   state.passwordCallback = null;
+  state.isImageSource = Boolean(isImageSource);
+  state.pageTextLines = {};
+  state.isScannedPage = {};
 
   elements.fileNameLabel.textContent = fileName;
   elements.btnExportPdf.disabled = true;
@@ -348,6 +631,10 @@ async function openPdfFile(arrayBuffer, fileName = 'document.pdf', password = ''
     elements.modeSwitchGroup.classList.add('flex');
     elements.floatingZoomHud.classList.remove('hidden');
     elements.floatingZoomHud.classList.add('flex');
+    if (elements.btnOcrPage) {
+      elements.btnOcrPage.classList.remove('hidden');
+      elements.btnOcrPage.classList.add('flex');
+    }
     if (elements.btnConvertAllText) {
       elements.btnConvertAllText.classList.remove('hidden');
       elements.btnConvertAllText.classList.add('flex');
@@ -491,6 +778,7 @@ async function renderPage(pageNum, skipSaveCurrent = false) {
           sanitizeFabricCanvasObjects(fabricCanvas);
           isTransitioningPage = false;
           sanitizeMaskColors();
+          prepareSeamlessMasksForCanvas(fabricCanvas, elements.pdfCanvas, 1.0);
           fabricCanvas.renderAll();
           resolve();
         });
@@ -499,9 +787,29 @@ async function renderPage(pageNum, skipSaveCurrent = false) {
       isTransitioningPage = false;
     }
 
-    // 5.1 Pre-extract and cache text lines for smart Word-like click editing
+    // 5.1 Pre-extract and cache text lines for smart Word-like click editing (preserve existing OCR lines if already recognized)
     try {
-      state.pageTextLines[pageNum] = await extractPageTextLines(page, viewport);
+      const existingLines = state.pageTextLines[pageNum];
+      const hasOcrLines = Array.isArray(existingLines) && existingLines.some(l => l.isOcr);
+      if (!hasOcrLines) {
+        state.pageTextLines[pageNum] = await extractPageTextLines(page, viewport);
+      }
+      const currentLines = state.pageTextLines[pageNum] || [];
+      const visibleLines = currentLines.filter(l => {
+        const c = samplePdfColors(l.left, l.top, l.width, l.height);
+        return c.hasVisibleInk;
+      });
+      if (state.isImageSource || visibleLines.length <= 2) {
+        state.isScannedPage[pageNum] = true;
+        if (elements.scanDetectedBanner && !hasOcrLines) {
+          elements.scanDetectedBanner.classList.remove('hidden');
+          elements.scanDetectedBanner.classList.add('flex');
+        }
+      } else {
+        if (elements.scanDetectedBanner) {
+          elements.scanDetectedBanner.classList.add('hidden');
+        }
+      }
     } catch (e) {
       console.warn('Text extraction warning:', e);
     }
@@ -758,8 +1066,8 @@ function setupFabricEventListeners() {
       }
     }
 
-    // 2. Cover & Edit / Pure Mask Rubberband Dragging
-    if (state.tool === 'cover-edit' || state.tool === 'mask') {
+    // 2. Cover & Edit / Pure Mask Rubberband Dragging (also enabled as fallback drag in tap-edit on scanned pages)
+    if (state.tool === 'cover-edit' || state.tool === 'mask' || (state.tool === 'tap-edit' && state.isScannedPage[state.currentPage] && !opt.target)) {
       state.isDrawingBox = true;
       state.boxStartX = pointer.x;
       state.boxStartY = pointer.y;
@@ -808,13 +1116,24 @@ function setupFabricEventListeners() {
     state.rubberBandRect = null;
 
     // Minimum drag threshold to prevent accidental clicks
-    if (width < 6 || height < 6) return;
+    if (width < 6 || height < 6) {
+      if (state.tool === 'tap-edit' && state.isScannedPage[state.currentPage]) {
+        const lines = state.pageTextLines[state.currentPage] || [];
+        if (lines.length <= 2) {
+          showToast('此页为扫描图片：请按住拖动框选文字无痕改，或点顶部「扫描件识别」开启点击即改！', 'info');
+        }
+      }
+      return;
+    }
+
+    const isCoverEditAction = (state.tool === 'cover-edit' || state.tool === 'tap-edit');
 
     // 1. Smart dual-sample background and text color from PDF
     const colors = samplePdfColors(left, top, width, height);
 
-    // 2. Create the solid mask rectangle
+    // 2. Create the background mask rectangle (with seamless texture patch on scanned images)
     const maskId = 'mask_' + Date.now();
+    const textId = 'text_' + Date.now();
     const maskRect = new fabric.Rect({
       left: left,
       top: top,
@@ -822,37 +1141,82 @@ function setupFabricEventListeners() {
       height: height,
       fill: colors.bgColor,
       selectable: (state.tool === 'mask'),
+      evented: (state.tool === 'mask'),
       hasBorders: true,
       borderColor: '#94a3b8',
       cornerSize: 12,
       strokeWidth: 0,
-      data: { isMask: true, id: maskId },
+      data: {
+        isMask: true,
+        id: maskId,
+        linkedTextId: isCoverEditAction ? textId : undefined,
+        initialMaskWidth: width,
+        initialLeft: left,
+        bgColor: colors.bgColor,
+      },
     });
+    buildMaskSeamlessPatch(maskRect, elements.pdfCanvas, 1.0);
     fabricCanvas.add(maskRect);
 
-    // 3. If in 'cover-edit' mode, immediately spawn in-place editable Textbox
-    if (state.tool === 'cover-edit') {
-      const calculatedFontSize = Math.max(12, Math.min(Math.round(height * 0.72), 48));
+    // 3. If in 'cover-edit' (or drag on scanned page in 'tap-edit'), immediately spawn in-place editable Textbox snapped to ink bounds!
+    if (isCoverEditAction) {
+      const inkBounds = detectInkBoundsInBox(left, top, width, height, colors.bgColor);
+      const hasTightInk = inkBounds && inkBounds.inkHeight >= 6;
+      const calculatedFontSize = hasTightInk
+        ? Math.max(10, Math.min(Math.round(inkBounds.inkHeight * 1.02), 48))
+        : Math.max(12, Math.min(Math.round(height * 0.72), 48));
       state.fontSize = calculatedFontSize;
 
+      const textLeft = hasTightInk ? inkBounds.inkLeft : left;
+      const textTop = hasTightInk
+        ? Math.max(top, Math.round(inkBounds.inkTop - calculatedFontSize * 0.08))
+        : top + Math.max(0, (height - calculatedFontSize * 1.18) / 2);
+      const detectedBold = hasTightInk ? inkBounds.isBold : Boolean(colors.isBoldInk || state.isBold);
+
+      // Check if an extracted or OCR line overlaps this dragged box to pre-fill its text
+      let prefillText = '点击输入修改文字';
+      const pageLines = state.pageTextLines[state.currentPage] || [];
+      for (const l of pageLines) {
+        const overlapX = Math.max(0, Math.min(left + width, l.left + l.width) - Math.max(left, l.left));
+        const overlapY = Math.max(0, Math.min(top + height, l.top + l.height) - Math.max(top, l.top));
+        if (overlapX > 4 && overlapY > 4 && l.text && l.text.trim()) {
+          prefillText = l.text.trim();
+          break;
+        }
+      }
+
       const initialWidth = Math.max(width + 20, 100);
-      const textbox = new fabric.Textbox('点击输入修改文字', {
-        left: left,
-        top: top + Math.max(0, (height - calculatedFontSize * 1.25) / 2),
+      const textbox = new fabric.Textbox(prefillText, {
+        left: textLeft,
+        top: textTop,
         width: initialWidth,
         fontSize: calculatedFontSize,
         fill: colors.textColor,
+        backgroundColor: 'transparent',
         fontFamily: 'system-ui, -apple-system, sans-serif',
-        fontWeight: state.isBold ? 'bold' : 'normal',
+        fontWeight: detectedBold ? 'bold' : 'normal',
         splitByGrapheme: true,
         editable: true,
+        hasBorders: true,
+        borderColor: '#93c5fd',
+        borderDashArray: [3, 3],
+        padding: 0,
+        lineHeight: 1.05,
+        cornerColor: '#2563eb',
+        cornerSize: 8,
+        touchCornerSize: 14,
         data: {
           isText: true,
+          id: textId,
           linkedMaskId: maskId,
           initialWidth: initialWidth,
           initialMaskWidth: width,
         },
       });
+
+      if (state.isScannedPage[state.currentPage] || colors.isScannedBg) {
+        applyScanInkBlend(textbox, true);
+      }
 
       textbox.on('changed', () => updateTextDimensionsAndMask(textbox));
       fabricCanvas.add(textbox);
@@ -860,14 +1224,15 @@ function setupFabricEventListeners() {
       textbox.enterEditing();
       textbox.selectAll();
 
-      showToast('已覆盖原文字，可直接打字替换！', 'info');
+      showToast('已无痕修复底纹并对齐原字号，直接打字替换！', 'info');
       setTool('tap-edit');
     } else {
       fabricCanvas.setActiveObject(maskRect);
-      showToast('已生成遮罩块覆盖原内容！', 'info');
+      showToast('已生成无痕背景遮罩覆盖原内容！', 'info');
       setTool('select');
     }
 
+    saveCurrentPageState(state.currentPage);
     fabricCanvas.requestRenderAll();
   });
 
@@ -894,6 +1259,58 @@ function setupFabricEventListeners() {
   fabricCanvas.on('object:modified', () => {
     saveCurrentPageState(state.currentPage);
   });
+}
+
+// Detect tight ink bounding box and stroke density inside a dragged region (for pixel-accurate font sizing on scanned images)
+function detectInkBoundsInBox(left, top, width, height, bgHex, sourceCanvas = null) {
+  try {
+    const pdfCanvas = sourceCanvas || elements.pdfCanvas;
+    if (!pdfCanvas) return null;
+    const ctx = pdfCanvas.getContext('2d', { willReadFrequently: true });
+
+    const l = Math.max(0, Math.floor(left));
+    const t = Math.max(0, Math.floor(top));
+    const w = Math.min(pdfCanvas.width - l, Math.ceil(width));
+    const h = Math.min(pdfCanvas.height - t, Math.ceil(height));
+    if (w < 4 || h < 4) return null;
+
+    const bg = parseHexRgb(bgHex || '#ffffff');
+    const data = ctx.getImageData(l, t, w, h).data;
+
+    let minX = w, maxX = -1, minY = h, maxY = -1;
+    let inkPixels = 0;
+
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = (y * w + x) * 4;
+        if (data[i + 3] < 80) continue;
+        const dist = Math.abs(data[i] - bg.r) + Math.abs(data[i + 1] - bg.g) + Math.abs(data[i + 2] - bg.b);
+        if (dist > 45) {
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+          inkPixels++;
+        }
+      }
+    }
+
+    if (maxX < minX || maxY < minY || inkPixels < 3) return null;
+    const inkW = Math.max(4, maxX - minX + 1);
+    const inkH = Math.max(4, maxY - minY + 1);
+    const inkDensity = inkPixels / Math.max(1, inkW * inkH);
+
+    return {
+      inkLeft: l + minX,
+      inkTop: t + minY,
+      inkWidth: inkW,
+      inkHeight: inkH,
+      inkDensity,
+      isBold: inkDensity > 0.26,
+    };
+  } catch (e) {
+    return null;
+  }
 }
 
 // Detect if the text is inside a colored container (e.g. a dark blue header card or pastel callout box) and find its right boundary
@@ -997,6 +1414,7 @@ function updateTextDimensionsAndMask(obj) {
         width: targetMaskWidth,
         height: Math.max(mask.height, (obj.getScaledHeight ? obj.getScaledHeight() : obj.height) + 1),
       });
+      buildMaskSeamlessPatch(mask, elements.pdfCanvas, 1.0);
     }
   }
 
@@ -1084,7 +1502,7 @@ function findClosestTextLine(lines, pt) {
 function convertLineToTextbox(line, shouldEditImmediately = true) {
   // 1. Sample surrounding background color and text contrast color
   const colors = samplePdfColors(line.left, line.top, line.width, line.height);
-  const isBoldFinal = Boolean(line.isBold);
+  const isBoldFinal = Boolean(line.isBold || (line.isOcr && colors.isBoldInk));
   const fontFamilyFinal = line.fontFamily || 'system-ui, -apple-system, sans-serif';
 
   const maskId = 'mask_' + Math.random().toString(36).substr(2, 9);
@@ -1098,7 +1516,7 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
     initialMaskWidth = maxAllowedMask;
   }
 
-  // 2. Solid background mask perfectly covers original PDF text (tight bounds)
+  // 2. Background mask perfectly covers original PDF/scan text (with seamless texture patch on scanned pages)
   const maskRect = new fabric.Rect({
     left: line.left,
     top: maskTop,
@@ -1118,6 +1536,7 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
       bgColor: colors.bgColor,
     },
   });
+  buildMaskSeamlessPatch(maskRect, elements.pdfCanvas, 1.0);
   fabricCanvas.add(maskRect);
 
   const measuredW = measureTextLineWidth(line.text, line.canvasFontSize, isBoldFinal ? 'bold' : 'normal', fontFamilyFinal);
@@ -1157,6 +1576,10 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
     },
   });
 
+  if (state.isScannedPage[state.currentPage] || colors.isScannedBg || line.isOcr) {
+    applyScanInkBlend(textbox, true);
+  }
+
   textbox.on('changed', () => updateTextDimensionsAndMask(textbox));
   fabricCanvas.add(textbox);
 
@@ -1171,7 +1594,7 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
       }
       fabricCanvas.requestRenderAll();
     }, 50);
-    showToast('已进入 Word 修改模式，直接打字替换！', 'info');
+    showToast('已进入无痕修改模式，直接打字替换！', 'info');
   }
 
   saveCurrentPageState(state.currentPage);
@@ -1182,11 +1605,11 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
 // One-Click Word Mode: Convert all text lines on the current page to editable textboxes
 async function convertAllTextToEditable() {
   if (!state.pdfDoc || !fabricCanvas) {
-    showToast('请先打开 PDF 文件', 'error');
+    showToast('请先打开 PDF 或图片文件', 'error');
     return;
   }
 
-  showToast('正在识别当前页文字，生成 Word 文本框...', 'info');
+  showToast('正在识别当前页文字，生成可编辑文本框...', 'info');
 
   let lines = state.pageTextLines[state.currentPage];
   if (!lines || lines.length === 0) {
@@ -1196,9 +1619,16 @@ async function convertAllTextToEditable() {
     state.pageTextLines[state.currentPage] = lines;
   }
 
-  if (!lines || lines.length === 0) {
-    showToast('当前页未检测到可选文字（可能是纯扫描图片）', 'warning');
-    return;
+  // Filter for lines with visible ink
+  const visibleCheck = (lines || []).filter(l => samplePdfColors(l.left, l.top, l.width, l.height).hasVisibleInk);
+
+  if (!lines || visibleCheck.length === 0) {
+    showToast('检测到当前页为扫描图片，正在自动启动智能 OCR 文字识别...', 'info');
+    await runOcrOnCurrentPage('eng');
+    lines = state.pageTextLines[state.currentPage] || [];
+    if (lines.length === 0) {
+      return;
+    }
   }
 
   let count = 0;
@@ -1444,24 +1874,39 @@ function samplePdfColors(left, top, width, height, sourceCanvas = null) {
       };
     }
 
-    // Snap to pure neutral white ONLY if all channels are >= 248 and almost equal (neutral paper scan noise)
-    // NEVER snap tinted backgrounds (like light blue #e8f3fb, light gray, pastel) to white!
-    const isPureNeutralWhite = (bg.r >= 248 && bg.g >= 248 && bg.b >= 248 &&
-                                Math.abs(bg.r - bg.g) <= 4 &&
-                                Math.abs(bg.r - bg.b) <= 4 &&
-                                Math.abs(bg.g - bg.b) <= 4);
-    if (isPureNeutralWhite) {
+    // Measure local background variance (scan paper grain vs digital flat fill)
+    let bgVarSum = 0, bgVarCnt = 0;
+    for (let i = 0; i < imgData.length; i += stride) {
+      if (imgData[i + 3] < 80) continue;
+      const d = (Math.abs(imgData[i] - bg.r) + Math.abs(imgData[i + 1] - bg.g) + Math.abs(imgData[i + 2] - bg.b)) / 3;
+      if (d <= 14) {
+        bgVarSum += d * d;
+        bgVarCnt++;
+      }
+    }
+    const bgStdDev = bgVarCnt > 2 ? Math.sqrt(bgVarSum / bgVarCnt) : 0;
+    const isScannedBg = (bgStdDev >= 1.15 || Boolean(state.isScannedPage[state.currentPage]) || state.isImageSource);
+
+    // Snap to pure neutral white ONLY if digital flat white (never snap off-white/warm/gray scanned paper!)
+    const isPureNeutralWhite = (bg.r >= 249 && bg.g >= 249 && bg.b >= 249 &&
+                                Math.abs(bg.r - bg.g) <= 3 &&
+                                Math.abs(bg.r - bg.b) <= 3 &&
+                                Math.abs(bg.g - bg.b) <= 3);
+    if ((bg.r >= 253 && bg.g >= 253 && bg.b >= 253) || (isPureNeutralWhite && !isScannedBg)) {
       bg = { r: 255, g: 255, b: 255 };
     }
 
-    // 2. Interior contrast sampling for text ink color
+    // 2. Interior contrast sampling for text ink color (prefer core ink pixels dist > 65 so anti-aliased scan fringes don't wash out text)
     let textR = 0, textG = 0, textB = 0, textCount = 0;
+    let coreR = 0, coreG = 0, coreB = 0, coreCount = 0;
+    let totalSampled = 0;
     for (let i = 0; i < imgData.length; i += stride) {
       const r = imgData[i];
       const g = imgData[i + 1];
       const b = imgData[i + 2];
       const a = imgData[i + 3];
       if (a < 80) continue;
+      totalSampled++;
 
       const dist = Math.abs(r - bg.r) + Math.abs(g - bg.g) + Math.abs(b - bg.b);
       if (dist > 45) { // Distinct contrast from background
@@ -1469,6 +1914,12 @@ function samplePdfColors(left, top, width, height, sourceCanvas = null) {
         textG += g;
         textB += b;
         textCount++;
+        if (dist > 70) {
+          coreR += r;
+          coreG += g;
+          coreB += b;
+          coreCount++;
+        }
       }
     }
 
@@ -1487,7 +1938,13 @@ function samplePdfColors(left, top, width, height, sourceCanvas = null) {
     }
 
     let text = { r: 17, g: 24, b: 39 }; // Default dark charcoal
-    if (textCount > 0) {
+    if (coreCount >= 2) {
+      text = {
+        r: Math.round(coreR / coreCount),
+        g: Math.round(coreG / coreCount),
+        b: Math.round(coreB / coreCount),
+      };
+    } else if (textCount > 0) {
       text = {
         r: Math.round(textR / textCount),
         g: Math.round(textG / textCount),
@@ -1498,11 +1955,13 @@ function samplePdfColors(left, top, width, height, sourceCanvas = null) {
     // Verify text contrast against background
     const bgBrightness = (bg.r * 299 + bg.g * 587 + bg.b * 114) / 1000;
     const textBrightness = (text.r * 299 + text.g * 587 + text.b * 114) / 1000;
-    if (bgBrightness > 140 && textBrightness > 100) {
-      text = { r: 17, g: 24, b: 39 }; // Force dark ink on light background
+    if (bgBrightness > 140 && textBrightness > 110) {
+      text = { r: 24, g: 30, b: 42 }; // Force dark ink on light background
     } else if (bgBrightness <= 140 && textBrightness < 140) {
       text = { r: 255, g: 255, b: 255 }; // Force white ink on dark background
     }
+
+    const inkDensity = totalSampled > 0 ? (textCount / totalSampled) : 0;
 
     // Bulletproof hex formatter: clamps to [0, 255] and pads 2 digits (zero bit-shift overflow risk)
     const clamp = (v) => Math.max(0, Math.min(255, Math.round(v || 0)));
@@ -1512,6 +1971,8 @@ function samplePdfColors(left, top, width, height, sourceCanvas = null) {
       bgColor: toHex(bg),
       textColor: toHex(text),
       hasVisibleInk: textCount > 0,
+      isScannedBg,
+      isBoldInk: inkDensity > 0.25,
     };
   } catch (err) {
     console.warn('samplePdfColors error:', err);
@@ -1631,6 +2092,13 @@ function updatePropertyBar() {
       } else if (elements.textBgPropControls) {
         elements.textBgPropControls.classList.add('hidden');
         elements.textBgPropControls.classList.remove('flex');
+      }
+
+      if (elements.btnToggleScanBlend) {
+        const isBlended = Boolean(activeObj.data?.scanBlend || activeObj.shadow);
+        elements.btnToggleScanBlend.className = isBlended
+          ? 'px-1.5 h-6 rounded bg-amber-600 text-white text-[10px] font-medium flex items-center gap-1 transition shadow-inner'
+          : 'px-1.5 h-6 rounded bg-slate-800 hover:bg-slate-700 text-amber-300 text-[10px] font-medium flex items-center gap-1 transition border border-slate-700';
       }
     } else if (activeObj.data?.isMask || activeObj.type === 'rect') {
       elements.maskPropControls.classList.remove('hidden');
@@ -1980,7 +2448,7 @@ async function exportModifiedPdf() {
   }
 }
 
-// Generates transparent overlay PNG for a single page
+// Generates transparent overlay PNG for a single page (with seamless paper texture patches for masks)
 async function generatePageOverlayPng(pageNum) {
   const rawState = (pageNum === state.currentPage && fabricCanvas && !isTransitioningPage)
     ? (() => { sanitizeFabricCanvasObjects(fabricCanvas); return fabricCanvas.toJSON(SERIALIZE_PROPS); })()
@@ -1994,6 +2462,18 @@ async function generatePageOverlayPng(pageNum) {
   const page = await state.pdfDoc.getPage(pageNum);
   const baseViewport = page.getViewport({ scale: state.baseScale });
 
+  // Render base PDF page onto an offscreen canvas so seamless masks on any page (1, 2, ...) have exact paper texture
+  let basePdfCanvas = (pageNum === state.currentPage && elements.pdfCanvas && elements.pdfCanvas.width > 0)
+    ? elements.pdfCanvas
+    : null;
+  if (!basePdfCanvas) {
+    basePdfCanvas = document.createElement('canvas');
+    basePdfCanvas.width = baseViewport.width;
+    basePdfCanvas.height = baseViewport.height;
+    const bCtx = basePdfCanvas.getContext('2d', { willReadFrequently: true });
+    await page.render({ canvasContext: bCtx, viewport: baseViewport }).promise;
+  }
+
   return new Promise(resolve => {
     const tempCanvas = document.createElement('canvas');
     const staticCanvas = new fabric.StaticCanvas(tempCanvas, {
@@ -2005,6 +2485,7 @@ async function generatePageOverlayPng(pageNum) {
 
     staticCanvas.loadFromJSON(jsonState, () => {
       sanitizeFabricCanvasObjects(staticCanvas);
+      prepareSeamlessMasksForCanvas(staticCanvas, basePdfCanvas, 1.0);
       staticCanvas.setViewportTransform([1, 0, 0, 1, 0, 0]);
       staticCanvas.renderAll();
       const url = staticCanvas.toDataURL({ format: 'png', multiplier: 1 });
@@ -2023,7 +2504,7 @@ async function renderDecryptedPageComposite(pageNum) {
   const offscreen = document.createElement('canvas');
   offscreen.width = renderViewport.width;
   offscreen.height = renderViewport.height;
-  const ctx = offscreen.getContext('2d');
+  const ctx = offscreen.getContext('2d', { willReadFrequently: true });
 
   // 1. Render decrypted PDF base
   await page.render({ canvasContext: ctx, viewport: renderViewport }).promise;
@@ -2048,6 +2529,7 @@ async function renderDecryptedPageComposite(pageNum) {
 
       staticCanvas.loadFromJSON(jsonState, () => {
         sanitizeFabricCanvasObjects(staticCanvas);
+        prepareSeamlessMasksForCanvas(staticCanvas, offscreen, scaleFactor);
         staticCanvas.setViewportTransform([scaleFactor, 0, 0, scaleFactor, 0, 0]);
         staticCanvas.renderAll();
         ctx.drawImage(fabricOffscreen, 0, 0, renderViewport.width, renderViewport.height);
@@ -2178,15 +2660,25 @@ function revertCurrentPage() {
 // 13. Setup UI Event Listeners
 // ==========================================
 function setupEventListeners() {
-  // File Upload Handlers
-  const handleFile = (file) => {
-    if (!file || file.type !== 'application/pdf') {
-      showToast('请选择有效的 PDF 文件', 'error');
+  // File Upload Handlers (Supports both PDF files and Scanned Images / Photos)
+  const handleFile = async (file) => {
+    if (!file) return;
+    const isPdf = (file.type === 'application/pdf' || /\.pdf$/i.test(file.name));
+    const isImage = (file.type.startsWith('image/') || /\.(jpe?g|png|webp|bmp)$/i.test(file.name));
+
+    if (!isPdf && !isImage) {
+      showToast('请选择有效的 PDF 文件或扫描图片 (.jpg/.png/.webp)', 'error');
       return;
     }
+
+    if (isImage) {
+      await openScannedImageAsPdf(file);
+      return;
+    }
+
     const reader = new FileReader();
     reader.onload = (e) => {
-      openPdfFile(e.target.result, file.name);
+      openPdfFile(e.target.result, file.name, '', null, false);
     };
     reader.readAsArrayBuffer(file);
   };
@@ -2249,7 +2741,24 @@ function setupEventListeners() {
   elements.btnZoomFit.addEventListener('click', () => fitToScreenWidth());
   elements.btnZoom200.addEventListener('click', () => setZoom(2.0));
 
-  // Word Mode & Direct Edit Buttons
+  // Word Mode, Scanned OCR & Direct Edit Buttons
+  if (elements.btnOcrPage) {
+    elements.btnOcrPage.addEventListener('click', () => runOcrOnCurrentPage('eng'));
+  }
+  if (elements.toolOcrPage) {
+    elements.toolOcrPage.addEventListener('click', () => runOcrOnCurrentPage('eng'));
+  }
+  if (elements.btnOcrFastEng) {
+    elements.btnOcrFastEng.addEventListener('click', () => runOcrOnCurrentPage('eng'));
+  }
+  if (elements.btnOcrChiEng) {
+    elements.btnOcrChiEng.addEventListener('click', () => runOcrOnCurrentPage('chi_sim+eng'));
+  }
+  if (elements.btnCloseScanBanner) {
+    elements.btnCloseScanBanner.addEventListener('click', () => {
+      elements.scanDetectedBanner.classList.add('hidden');
+    });
+  }
   if (elements.btnConvertAllText) {
     elements.btnConvertAllText.addEventListener('click', convertAllTextToEditable);
   }
@@ -2403,10 +2912,48 @@ function setupEventListeners() {
         const mask = fabricCanvas.getObjects().find(o => o.data?.id === activeObj.data.linkedMaskId);
         if (mask) {
           mask.set('fill', e.target.value);
-          if (mask.data) mask.data.bgColor = e.target.value;
+          mask._patchCanvas = null;
+          if (mask.data) {
+            mask.data.bgColor = e.target.value;
+            mask.data.customSolidColor = true;
+          }
           fabricCanvas.requestRenderAll();
           saveCurrentPageState(state.currentPage);
         }
+      }
+    });
+  }
+  if (elements.btnRestoreSeamlessMask) {
+    elements.btnRestoreSeamlessMask.addEventListener('click', () => {
+      const activeObj = fabricCanvas?.getActiveObject();
+      if (activeObj && activeObj.data?.linkedMaskId) {
+        const mask = fabricCanvas.getObjects().find(o => o.data?.id === activeObj.data.linkedMaskId);
+        if (mask) {
+          const sampled = samplePdfColors(mask.left, mask.top, mask.width, mask.height);
+          mask.set('fill', sampled.bgColor);
+          if (mask.data) {
+            mask.data.bgColor = sampled.bgColor;
+            mask.data.customSolidColor = false;
+          }
+          buildMaskSeamlessPatch(mask, elements.pdfCanvas, 1.0);
+          if (elements.inputTextBgColor) elements.inputTextBgColor.value = sampled.bgColor;
+          fabricCanvas.requestRenderAll();
+          saveCurrentPageState(state.currentPage);
+          showToast('已恢复无痕纸张底纹修复！', 'success');
+        }
+      }
+    });
+  }
+  if (elements.btnToggleScanBlend) {
+    elements.btnToggleScanBlend.addEventListener('click', () => {
+      const activeObj = fabricCanvas?.getActiveObject();
+      if (activeObj && (activeObj.type === 'textbox' || activeObj.type === 'i-text')) {
+        const nextBlend = !Boolean(activeObj.data?.scanBlend || activeObj.shadow);
+        applyScanInkBlend(activeObj, nextBlend);
+        updatePropertyBar();
+        fabricCanvas.requestRenderAll();
+        saveCurrentPageState(state.currentPage);
+        showToast(nextBlend ? '已开启扫描件墨迹柔化，边缘更自然！' : '已切换为高清锐利文字', 'info');
       }
     });
   }
@@ -3049,6 +3596,226 @@ async function clearDraftStorage() {
   }
 }
 
+// ==========================================
+// 16. Scanned Image Upload & Pure Client-Side OCR Engine (扫描件识别 & 无痕改字)
+// ==========================================
+async function openScannedImageAsPdf(file) {
+  try {
+    showExportProgress(true, '正在加载扫描图片并构建高清页面...');
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => resolve(e.target.result);
+      reader.onerror = () => reject(new Error('读取图片失败'));
+      reader.readAsDataURL(file);
+    });
+
+    const img = await new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error('解码图片失败'));
+      image.src = dataUrl;
+    });
+
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = img.naturalWidth || img.width;
+    tempCanvas.height = img.naturalHeight || img.height;
+    const tCtx = tempCanvas.getContext('2d');
+    tCtx.fillStyle = '#ffffff';
+    tCtx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
+    tCtx.drawImage(img, 0, 0);
+
+    const jpgDataUrl = tempCanvas.toDataURL('image/jpeg', 0.96);
+    const pdfDoc = await PDFLib.PDFDocument.create();
+    const embeddedJpg = await pdfDoc.embedJpg(jpgDataUrl);
+
+    const pageWidthPt = 612; // Standard Letter width in pt
+    const pageHeightPt = Math.max(200, Math.round((tempCanvas.height / tempCanvas.width) * pageWidthPt));
+    const page = pdfDoc.addPage([pageWidthPt, pageHeightPt]);
+    page.drawImage(embeddedJpg, {
+      x: 0,
+      y: 0,
+      width: pageWidthPt,
+      height: pageHeightPt,
+    });
+
+    const pdfBytes = await pdfDoc.save();
+    showExportProgress(false);
+
+    const displayFileName = file.name.replace(/\.(jpe?g|png|webp|bmp)$/i, '') + '.pdf';
+    await openPdfFile(pdfBytes.buffer, displayFileName, '', null, true);
+    showToast('扫描图片已加载！可点顶部「扫描件识别」或用「框选无痕改字」直接改', 'success');
+  } catch (err) {
+    showExportProgress(false);
+    console.error('openScannedImageAsPdf error:', err);
+    showToast('加载图片失败: ' + err.message, 'error');
+  }
+}
+
+let isRunningOcr = false;
+async function runOcrOnCurrentPage(lang = 'eng') {
+  if (!state.pdfDoc || !fabricCanvas) {
+    showToast('请先打开 PDF 或扫描图片', 'error');
+    return [];
+  }
+  if (isRunningOcr) return [];
+
+  if (typeof Tesseract === 'undefined') {
+    showToast('OCR 识别组件正在加载，请稍候重试，或直接使用底部「框选无痕改字」', 'warning');
+    return [];
+  }
+
+  isRunningOcr = true;
+  const pageNum = state.currentPage;
+  const langLabel = lang.includes('chi') ? '中英混合' : '英文/数字账单';
+  showExportProgress(true, `正在启动智能 OCR (${langLabel}) 识别第 ${pageNum} 页...`);
+
+  try {
+    // 1. Render current page at 2.0x scale for crisp OCR accuracy
+    const page = await state.pdfDoc.getPage(pageNum);
+    const ocrScale = 2.0;
+    const ocrViewport = page.getViewport({ scale: ocrScale });
+    const ocrCanvas = document.createElement('canvas');
+    ocrCanvas.width = ocrViewport.width;
+    ocrCanvas.height = ocrViewport.height;
+    const ocrCtx = ocrCanvas.getContext('2d', { willReadFrequently: true });
+    await page.render({ canvasContext: ocrCtx, viewport: ocrViewport }).promise;
+
+    const coordRatio = state.baseScale / ocrScale; // Maps 2.0x OCR coords back to 1.5x baseScale canvas coords
+
+    // 2. Run client-side Tesseract.js recognition
+    const result = await Tesseract.recognize(ocrCanvas, lang, {
+      logger: (m) => {
+        if (m && m.status) {
+          const pct = typeof m.progress === 'number' ? Math.round(m.progress * 100) : 0;
+          if (m.status.includes('recognizing')) {
+            showExportProgress(true, `正在智能识别图中文字与坐标... ${pct}%`);
+          } else if (m.status.includes('loading') || m.status.includes('initializing')) {
+            showExportProgress(true, `正在加载本地 OCR 识别引擎 (${langLabel})... ${pct}%`);
+          }
+        }
+      },
+    });
+
+    const rawWords = (result?.data?.words || []).filter(w => {
+      const txt = (w.text || '').trim();
+      if (!txt) return false;
+      if (w.confidence !== undefined && w.confidence < 28) return false;
+      const bw = (w.bbox.x1 - w.bbox.x0) * coordRatio;
+      const bh = (w.bbox.y1 - w.bbox.y0) * coordRatio;
+      return bw >= 4 && bh >= 5 && bh <= 120;
+    });
+
+    const wordItems = rawWords.map(w => {
+      const left = w.bbox.x0 * coordRatio;
+      const top = w.bbox.y0 * coordRatio;
+      const width = (w.bbox.x1 - w.bbox.x0) * coordRatio;
+      const height = (w.bbox.y1 - w.bbox.y0) * coordRatio;
+      const canvasFontSize = Math.max(9, Math.min(48, Math.round(height * 0.96)));
+      return {
+        str: w.text.trim(),
+        left,
+        top,
+        width,
+        height,
+        vy: top + height * 0.85,
+        canvasFontSize,
+        isOcr: true,
+      };
+    });
+
+    // Sort top-to-bottom, then left-to-right
+    wordItems.sort((a, b) => {
+      if (Math.abs(a.vy - b.vy) > Math.max(6, Math.min(a.height, b.height) * 0.45)) {
+        return a.vy - b.vy;
+      }
+      return a.left - b.left;
+    });
+
+    // Cluster adjacent words on the same line (without crossing table columns)
+    const clusteredLines = [];
+    let current = null;
+
+    for (const item of wordItems) {
+      if (!current) {
+        current = { ...item, text: item.str };
+        continue;
+      }
+      const sameBaseline = Math.abs(current.vy - item.vy) <= Math.max(6, item.height * 0.48);
+      const xGap = item.left - (current.left + current.width);
+      const sameSize = Math.abs(current.canvasFontSize - item.canvasFontSize) <= 4;
+      const isClose = (xGap >= -6 && xGap <= Math.min(22, item.height * 1.35));
+
+      if (sameBaseline && sameSize && isClose) {
+        const isCjk = /[\u4e00-\u9fa5]/.test(current.text.slice(-1)) && /[\u4e00-\u9fa5]/.test(item.str[0]);
+        const sep = (xGap > 1 && !isCjk) ? ' ' : '';
+        current.text += sep + item.str;
+        current.top = Math.min(current.top, item.top);
+        const bottom = Math.max(current.top + current.height, item.top + item.height);
+        current.width = (item.left + item.width) - current.left;
+        current.height = bottom - current.top;
+        current.canvasFontSize = Math.round((current.canvasFontSize + item.canvasFontSize) / 2);
+      } else {
+        clusteredLines.push(current);
+        current = { ...item, text: item.str };
+      }
+    }
+    if (current) clusteredLines.push(current);
+
+    // Refine each OCR line using pixel-level ink bounds & stroke density
+    const finalLines = [];
+    clusteredLines.forEach((line, idx) => {
+      const colors = samplePdfColors(line.left, line.top, line.width, line.height);
+      if (!colors.hasVisibleInk) return;
+      const inkBounds = detectInkBoundsInBox(line.left, line.top, line.width, line.height, colors.bgColor);
+      const refinedTop = inkBounds ? inkBounds.inkTop : line.top;
+      const refinedHeight = inkBounds ? Math.max(8, inkBounds.inkHeight) : line.height;
+      const refinedFontSize = Math.max(9, Math.min(48, Math.round(refinedHeight * 1.02)));
+
+      finalLines.push({
+        id: `ocr_p${pageNum}_${idx}`,
+        text: line.text,
+        str: line.text,
+        left: inkBounds ? inkBounds.inkLeft : line.left,
+        top: refinedTop,
+        width: inkBounds ? Math.max(line.width, inkBounds.inkWidth) : line.width,
+        height: refinedHeight,
+        canvasFontSize: refinedFontSize,
+        pdfFontSize: Math.round(refinedFontSize / state.baseScale),
+        isBold: inkBounds ? inkBounds.isBold : Boolean(colors.isBoldInk),
+        fontFamily: 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
+        isOcr: true,
+      });
+    });
+
+    state.pageTextLines[pageNum] = finalLines;
+    state.isScannedPage[pageNum] = true;
+
+    if (elements.scanDetectedBanner) {
+      elements.scanDetectedBanner.classList.add('hidden');
+    }
+
+    showExportProgress(false);
+    setTool('tap-edit');
+
+    if (finalLines.length > 0) {
+      showToast(`✨ 识别完成！共定位 ${finalLines.length} 处文字，直接点击图中文字即可无痕修改！`, 'success');
+      if (window.confetti) {
+        window.confetti({ particleCount: 55, spread: 65, origin: { y: 0.75 } });
+      }
+    } else {
+      showToast('未识别出清晰文字，您可直接使用底部「框选无痕改字」拖拽修改任意位置', 'warning');
+    }
+    return finalLines;
+  } catch (err) {
+    showExportProgress(false);
+    console.error('OCR error:', err);
+    showToast('OCR 识别失败: ' + err.message + '，可使用底部「框选无痕改字」', 'error');
+    return [];
+  } finally {
+    isRunningOcr = false;
+  }
+}
+
 // Expose functions for debugging & tests
 window.openPdfFile = openPdfFile;
 window.openCompareModal = openCompareModal;
@@ -3057,6 +3824,8 @@ window.exportModifiedPdf = exportModifiedPdf;
 window.convertAllTextToEditable = convertAllTextToEditable;
 window.openBatchReplaceModal = openBatchReplaceModal;
 window.executeBatchReplace = executeBatchReplace;
+window.runOcrOnCurrentPage = runOcrOnCurrentPage;
+window.buildMaskSeamlessPatch = buildMaskSeamlessPatch;
 
 // Initialize Application
 function initApp() {
