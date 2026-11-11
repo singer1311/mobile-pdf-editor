@@ -73,6 +73,8 @@ const SERIALIZE_PROPS = [
   'opacity',
   'angle',
   'charSpacing',
+  'fontStyle',
+  'fontFamily',
   'borderColor',
   'borderDashArray',
   'borderScaleFactor',
@@ -543,6 +545,7 @@ const elements = {
   // Header & Controls
   fileNameLabel: document.getElementById('file-name-label'),
   pageNavControls: document.getElementById('page-nav-controls'),
+  btnPageJump: document.getElementById('btn-page-jump'),
   currentPageNum: document.getElementById('current-page-num'),
   totalPageNum: document.getElementById('total-page-num'),
   btnPrevPage: document.getElementById('btn-prev-page'),
@@ -601,11 +604,13 @@ const elements = {
   textPropControls: document.getElementById('text-prop-controls'),
   maskPropControls: document.getElementById('mask-prop-controls'),
   brushPropControls: document.getElementById('brush-prop-controls'),
+  selectFontFamily: document.getElementById('select-font-family'),
   labelFontSize: document.getElementById('label-font-size'),
   btnFontMinus: document.getElementById('btn-font-minus'),
   btnFontPlus: document.getElementById('btn-font-plus'),
   inputTextColor: document.getElementById('input-text-color'),
   btnTextBold: document.getElementById('btn-text-bold'),
+  btnTextItalic: document.getElementById('btn-text-italic'),
   textBgPropControls: document.getElementById('text-bg-prop-controls'),
   inputTextBgColor: document.getElementById('input-text-bg-color'),
   inputMaskColor: document.getElementById('input-mask-color'),
@@ -961,14 +966,88 @@ async function renderPage(pageNum, skipSaveCurrent = false) {
   }
 }
 
+let isRestoringHistory = false;
 function saveCurrentPageState(pageNum) {
   if (!fabricCanvas || isTransitioningPage) return;
   const p = pageNum || state.currentPage;
   sanitizeFabricCanvasObjects(fabricCanvas);
   const json = fabricCanvas.toJSON(SERIALIZE_PROPS);
   delete json.viewportTransform;
-  state.pageStates[p] = normalizePageStateJson(json);
+  const normalized = normalizePageStateJson(json);
+
+  if (!isRestoringHistory) {
+    const emptyStateStr = JSON.stringify({ version: normalized?.version || '5.3.0', objects: [] });
+    const prevStr = state.pageStates[p] ? JSON.stringify(state.pageStates[p]) : emptyStateStr;
+    const nextStr = JSON.stringify(normalized);
+    if (prevStr !== nextStr) {
+      if (!Array.isArray(state.historyStack[p])) state.historyStack[p] = [];
+      const last = state.historyStack[p][state.historyStack[p].length - 1];
+      if (last !== prevStr) {
+        state.historyStack[p].push(prevStr);
+        if (state.historyStack[p].length > 25) state.historyStack[p].shift();
+      }
+    }
+  }
+
+  state.pageStates[p] = normalized;
   saveDraftToStorage();
+}
+
+async function undoLastAction() {
+  if (!fabricCanvas || !state.pdfDoc) return;
+  const p = state.currentPage;
+  const stack = state.historyStack[p];
+
+  if (!Array.isArray(stack) || stack.length === 0) {
+    // Fallback for any unsaved legacy objects
+    const objects = fabricCanvas.getObjects();
+    if (objects.length > 0) {
+      const topObj = objects[objects.length - 1];
+      if (topObj.data?.linkedMaskId) {
+        const mask = objects.find(o => o.data?.id === topObj.data.linkedMaskId);
+        if (mask) fabricCanvas.remove(mask);
+      }
+      fabricCanvas.remove(topObj);
+      saveCurrentPageState(p);
+      updatePropertyBar();
+      fabricCanvas.requestRenderAll();
+      showToast('已撤销上一步操作', 'info');
+    } else {
+      showToast('当前页暂无更多可撤销操作', 'info');
+    }
+    return;
+  }
+
+  const prevJsonStr = stack.pop();
+  const prevState = normalizePageStateJson(JSON.parse(prevJsonStr));
+
+  isRestoringHistory = true;
+  try {
+    fabricCanvas.discardActiveObject();
+    await new Promise((resolve) => {
+      fabricCanvas.loadFromJSON(prevState, () => {
+        sanitizeFabricCanvasObjects(fabricCanvas);
+        sanitizeMaskColors();
+        prepareSeamlessMasksForCanvas(fabricCanvas, elements.pdfCanvas, 1.0);
+        fabricCanvas.getObjects().forEach(o => {
+          if (o.data?.isText) {
+            o.on('changed', () => updateTextDimensionsAndMask(o));
+          }
+        });
+        fabricCanvas.renderAll();
+        resolve();
+      });
+    });
+    state.pageStates[p] = prevState;
+    applyCurrentMode();
+    saveDraftToStorage();
+    showToast('已撤销上一步操作', 'info');
+  } catch (err) {
+    console.error('Undo failed:', err);
+    showToast('撤销失败: ' + err.message, 'error');
+  } finally {
+    isRestoringHistory = false;
+  }
 }
 
 function updatePaginationUI() {
@@ -1388,8 +1467,11 @@ function setupFabricEventListeners() {
     }
   });
 
-  // Object modified (for history)
+  // Object modified / freehand brush stroke (for history & multi-page persistence)
   fabricCanvas.on('object:modified', () => {
+    saveCurrentPageState(state.currentPage);
+  });
+  fabricCanvas.on('path:created', () => {
     saveCurrentPageState(state.currentPage);
   });
 }
@@ -1459,7 +1541,7 @@ async function createAndSelectBoxWithLocalOcr(left, top, width, height, enterEdi
       }
       const res = await Tesseract.recognize(cropCanvas, 'eng');
       const rawTxt = (res?.data?.text || '').replace(/\s+/g, ' ').trim();
-      const normTxt = normalizeOcrToken(rawTxt);
+      const normTxt = cleanOcrToken(rawTxt);
       if (normTxt) prefillText = normTxt;
     } catch (e) {}
   }
@@ -2421,11 +2503,29 @@ function updatePropertyBar() {
       elements.maskPropControls.classList.add('hidden');
       elements.brushPropControls.classList.add('hidden');
 
+      if (elements.selectFontFamily) {
+        const ff = (activeObj.fontFamily || '').toLowerCase();
+        if (ff.includes('monospace') || ff.includes('courier') || ff.includes('consolas')) {
+          elements.selectFontFamily.value = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+        } else if (ff.includes('serif') && !ff.includes('sans-serif')) {
+          elements.selectFontFamily.value = 'Georgia, Cambria, "Times New Roman", Times, serif';
+        } else if (ff.includes('arial') || ff.includes('helvetica')) {
+          elements.selectFontFamily.value = 'Arial, Helvetica, sans-serif';
+        } else {
+          elements.selectFontFamily.value = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+        }
+      }
+
       elements.labelFontSize.textContent = Math.round(activeObj.fontSize || 16);
       elements.inputTextColor.value = activeObj.fill || '#111827';
       elements.btnTextBold.className = (activeObj.fontWeight === 'bold')
         ? 'w-6 h-6 rounded bg-blue-600 text-white flex items-center justify-center font-bold text-xs'
         : 'w-6 h-6 rounded bg-slate-800 hover:bg-slate-700 flex items-center justify-center font-bold text-xs';
+      if (elements.btnTextItalic) {
+        elements.btnTextItalic.className = (activeObj.fontStyle === 'italic')
+          ? 'w-6 h-6 rounded bg-blue-600 text-white flex items-center justify-center italic font-serif text-xs'
+          : 'w-6 h-6 rounded bg-slate-800 hover:bg-slate-700 flex items-center justify-center italic font-serif text-xs';
+      }
 
       if (activeObj.data?.linkedMaskId) {
         const mask = fabricCanvas.getObjects().find(o => o.data?.id === activeObj.data.linkedMaskId);
@@ -2725,13 +2825,28 @@ async function exportModifiedPdf() {
     }
 
     if (canUseDirectPdfLib && originalDoc) {
-      // --- Strategy A: Direct Overlay onto Original Vector Pages ---
+      // --- Strategy A: Direct Overlay onto Original Vector Pages (and clean reconstruction for rotated pages) ---
       for (let p = 1; p <= state.totalPages; p++) {
         showExportProgress(true, `正在合成第 ${p} / ${state.totalPages} 页修改...`);
+        const pdfPage = originalDoc.getPage(p - 1);
+        const pageRot = (((pdfPage.getRotation && pdfPage.getRotation().angle) || 0) % 360 + 360) % 360;
         const overlayPngUrl = await generatePageOverlayPng(p);
-        if (overlayPngUrl) {
+
+        if (pageRot !== 0 && overlayPngUrl) {
+          // For rotated pages (intrinsic /Rotate or user-rotated via rotateCurrentPage90),
+          // rebuild into an upright normalized page so overlays match PDF.js coordinates 1:1.
+          const composite = await renderDecryptedPageComposite(p);
+          const embeddedComposite = await originalDoc.embedPng(composite.dataUrl);
+          originalDoc.removePage(p - 1);
+          const uprightPage = originalDoc.insertPage(p - 1, [composite.widthPt, composite.heightPt]);
+          uprightPage.drawImage(embeddedComposite, {
+            x: 0,
+            y: 0,
+            width: composite.widthPt,
+            height: composite.heightPt,
+          });
+        } else if (overlayPngUrl) {
           const embeddedImage = await originalDoc.embedPng(overlayPngUrl);
-          const pdfPage = originalDoc.getPage(p - 1);
           const { width, height } = pdfPage.getSize();
           pdfPage.drawImage(embeddedImage, {
             x: 0,
@@ -3006,8 +3121,18 @@ function revertCurrentPage() {
 // ==========================================
 function setupEventListeners() {
   // File Upload Handlers (Supports both PDF files and Scanned Images / Photos)
+  const MAX_FILE_BYTES = 80 * 1024 * 1024; // 80 MB safe browser memory guard
   const handleFile = async (file) => {
     if (!file) return;
+    if (file.size === 0) {
+      showToast('所选文件为空（0 字节），请重新选择', 'error');
+      return;
+    }
+    if (file.size > MAX_FILE_BYTES) {
+      showToast('文件超过 80MB，可能导致移动端内存不足，请压缩后重试', 'error');
+      return;
+    }
+
     const isPdf = (file.type === 'application/pdf' || /\.pdf$/i.test(file.name));
     const isImage = (file.type.startsWith('image/') || /\.(jpe?g|png|webp|bmp)$/i.test(file.name));
 
@@ -3022,6 +3147,7 @@ function setupEventListeners() {
     }
 
     const reader = new FileReader();
+    reader.onerror = () => showToast('读取文件失败，请检查文件权限后重试', 'error');
     reader.onload = (e) => {
       openPdfFile(e.target.result, file.name, '', null, false);
     };
@@ -3067,13 +3193,26 @@ function setupEventListeners() {
     }
   });
 
-  // Pagination
+  // Pagination & Quick Page Jump
   elements.btnPrevPage.addEventListener('click', () => {
     if (state.currentPage > 1) renderPage(state.currentPage - 1);
   });
   elements.btnNextPage.addEventListener('click', () => {
     if (state.currentPage < state.totalPages) renderPage(state.currentPage + 1);
   });
+  if (elements.btnPageJump) {
+    elements.btnPageJump.addEventListener('click', () => {
+      if (!state.pdfDoc || state.totalPages <= 1) return;
+      const input = prompt(`跳转到指定页码 (1 - ${state.totalPages})：`, String(state.currentPage));
+      if (!input) return;
+      const target = parseInt(input.trim(), 10);
+      if (Number.isFinite(target) && target >= 1 && target <= state.totalPages) {
+        if (target !== state.currentPage) renderPage(target);
+      } else {
+        showToast(`请输入 1 到 ${state.totalPages} 之间的有效页码`, 'error');
+      }
+    });
+  }
 
   // Mode Switch
   elements.btnModeBrowse.addEventListener('click', () => setMode('browse'));
@@ -3177,17 +3316,20 @@ function setupEventListeners() {
   elements.toolMask.addEventListener('click', () => setTool('mask'));
   elements.imageUploadInput.addEventListener('change', handleImageUpload);
 
-  // Undo Button
+  // Undo Button (Real per-page snapshot stack)
   elements.btnUndo.addEventListener('click', () => {
-    if (!fabricCanvas) return;
-    const objects = fabricCanvas.getObjects();
-    if (objects.length > 0) {
-      fabricCanvas.remove(objects[objects.length - 1]);
-      saveCurrentPageState(state.currentPage);
-      fabricCanvas.requestRenderAll();
-      showToast('已撤销上一步操作', 'info');
-    } else {
-      showToast('当前页暂无操作可撤销', 'info');
+    undoLastAction();
+  });
+
+  // Global Ctrl+Z / Cmd+Z Undo shortcut
+  window.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === 'z' || e.key === 'Z')) {
+      const activeObj = fabricCanvas?.getActiveObject();
+      if (activeObj && activeObj.isEditing) return; // Keep native text cursor undo while typing
+      const tag = (document.activeElement?.tagName || '').toLowerCase();
+      if (tag === 'input' || tag === 'textarea') return;
+      e.preventDefault();
+      undoLastAction();
     }
   });
 
@@ -3223,13 +3365,22 @@ function setupEventListeners() {
   });
 
   // Property Bar Events
+  if (elements.selectFontFamily) {
+    elements.selectFontFamily.addEventListener('change', (e) => {
+      const obj = fabricCanvas?.getActiveObject();
+      if (obj && (obj.type === 'textbox' || obj.type === 'i-text')) {
+        obj.set('fontFamily', e.target.value);
+        updateTextDimensionsAndMask(obj);
+        showToast('已切换字体样式', 'info');
+      }
+    });
+  }
   elements.btnFontMinus.addEventListener('click', () => {
     const obj = fabricCanvas?.getActiveObject();
     if (obj && (obj.type === 'textbox' || obj.type === 'i-text')) {
       obj.set('fontSize', Math.max(10, (obj.fontSize || 16) - 2));
       elements.labelFontSize.textContent = Math.round(obj.fontSize);
-      fabricCanvas.requestRenderAll();
-      saveCurrentPageState(state.currentPage);
+      updateTextDimensionsAndMask(obj);
     }
   });
   elements.btnFontPlus.addEventListener('click', () => {
@@ -3237,8 +3388,7 @@ function setupEventListeners() {
     if (obj && (obj.type === 'textbox' || obj.type === 'i-text')) {
       obj.set('fontSize', Math.min(72, (obj.fontSize || 16) + 2));
       elements.labelFontSize.textContent = Math.round(obj.fontSize);
-      fabricCanvas.requestRenderAll();
-      saveCurrentPageState(state.currentPage);
+      updateTextDimensionsAndMask(obj);
     }
   });
   elements.btnTextBold.addEventListener('click', () => {
@@ -3251,11 +3401,27 @@ function setupEventListeners() {
         obj.setSelectionStyles({ fontWeight: targetWeight });
       }
       updatePropertyBar();
-      fabricCanvas.requestRenderAll();
-      saveCurrentPageState(state.currentPage);
+      updateTextDimensionsAndMask(obj);
       showToast(isBold ? '已取消加粗' : '已设置为加粗', 'info');
     }
   });
+  if (elements.btnTextItalic) {
+    elements.btnTextItalic.addEventListener('click', () => {
+      const obj = fabricCanvas?.getActiveObject();
+      if (obj && (obj.type === 'textbox' || obj.type === 'i-text')) {
+        const isItalic = (obj.fontStyle === 'italic');
+        const targetStyle = isItalic ? 'normal' : 'italic';
+        obj.set('fontStyle', targetStyle);
+        if (obj.isEditing && obj.selectionStart !== obj.selectionEnd) {
+          obj.setSelectionStyles({ fontStyle: targetStyle });
+        }
+        updatePropertyBar();
+        fabricCanvas.requestRenderAll();
+        saveCurrentPageState(state.currentPage);
+        showToast(isItalic ? '已取消斜体' : '已设置为斜体', 'info');
+      }
+    });
+  }
   elements.inputTextColor.addEventListener('input', (e) => {
     const obj = fabricCanvas?.getActiveObject();
     if (obj && (obj.type === 'textbox' || obj.type === 'i-text')) {
@@ -3329,22 +3495,26 @@ function setupEventListeners() {
     });
   });
 
-  // Mask Color Swatches
-  elements.inputMaskColor.addEventListener('input', (e) => {
+  // Mask / Privacy Redaction Color Swatches
+  const applyMaskSolidColor = (color) => {
     const obj = fabricCanvas?.getActiveObject();
-    if (obj) {
-      obj.set('fill', e.target.value);
-      fabricCanvas.requestRenderAll();
-    }
-  });
+    if (!obj) return;
+    obj.set('fill', color);
+    obj._patchCanvas = null;
+    if (!obj.data) obj.data = {};
+    obj.data.bgColor = color;
+    obj.data.customSolidColor = true;
+    fabricCanvas.requestRenderAll();
+    saveCurrentPageState(state.currentPage);
+  };
+  elements.inputMaskColor.addEventListener('input', (e) => applyMaskSolidColor(e.target.value));
   document.querySelectorAll('.mask-color-swatch').forEach(btn => {
     btn.addEventListener('click', () => {
       const color = btn.dataset.color;
-      const obj = fabricCanvas?.getActiveObject();
-      if (obj) {
-        obj.set('fill', color);
-        elements.inputMaskColor.value = color;
-        fabricCanvas.requestRenderAll();
+      elements.inputMaskColor.value = color;
+      applyMaskSolidColor(color);
+      if (color === '#000000') {
+        showToast('已切换为隐私涂黑打码模式', 'info');
       }
     });
   });
@@ -3513,7 +3683,7 @@ function renderReplaceDetectedChips() {
     if (state.isScannedPage[state.currentPage]) {
       elements.replaceDetectedChipsContainer.classList.remove('hidden');
       if (elements.replaceChipsTitle) {
-        elements.replaceChipsTitle.textContent = '当前 PDF 为纯扫描图片，点击右侧「深度OCR识字」即可提取全部编号与文字：';
+        elements.replaceChipsTitle.textContent = '当前页为扫描图像，点击右侧「重新OCR识字」即可提取文字：';
       }
       elements.replaceDetectedChips.innerHTML = '';
     } else {
@@ -3522,7 +3692,7 @@ function renderReplaceDetectedChips() {
     return;
   }
 
-  // Prioritize tokens containing digits/IDs (like IOE0914412232, 221-556-390, C09, dates, amounts) first
+  // Prioritize numeric values, dates, and longer tokens first
   tokens.sort((a, b) => {
     const aHasDigit = /\d/.test(a) ? 1 : 0;
     const bHasDigit = /\d/.test(b) ? 1 : 0;
@@ -4169,117 +4339,10 @@ async function openScannedImageAsPdf(file) {
   }
 }
 
-// Normalize OCR tokens corrupted by security watermarks (e.g., eagle feathers over IOE receipt numbers, C09, dates)
-function normalizeOcrToken(raw) {
+// Trim stray surrounding whitespace and punctuation artifacts on general OCR tokens
+function cleanOcrToken(raw) {
   if (!raw) return '';
-  let s = String(raw).trim().replace(/^[“"‘'«»~`]+|[”"’'«»~`]+$/g, '');
-  if (!s) return '';
-
-  // 1. USCIS Receipt Numbers: IOE + 10 digits (where eagle feather often turns 'I' into 'J'/'1'/'l' and '0' into 'O')
-  if (/^[IJ1l|][O0Q]E[0-9OIlG]{8,12}$/i.test(s)) {
-    const tail = s.slice(3).replace(/O/gi, '0').replace(/[Il|]/g, '1').replace(/G/g, '6');
-    s = 'IOE' + tail;
-  }
-  // 2. Category codes like C09 (often read as Ce9 / Co9 / C09)
-  if (/^C[eEoO0]9$/i.test(s)) {
-    s = 'C09';
-  }
-  // 3. USCIS / A-Number format ###-###-###
-  if (/^22[13][+-]?\d{3}-\d{3}$/.test(s)) {
-    s = s.replace(/^22[13][+-]?/, '221-');
-  }
-  // 4. Watermark-corrupted Dates like 0213/23 -> 02/13/23 or 02112125 -> 02/12/25
-  if (/^0213\/23$/.test(s)) s = '02/13/23';
-  if (/^02112125$/.test(s)) s = '02/12/25';
-  if (/^[OA]INGYUAN$/i.test(s) || /^ORINGYUAN$/i.test(s)) s = 'XINGYUAN';
-
-  return s;
-}
-
-function isUsefulOcrToken(cleanStr, conf, bw, bh, isFilteredPass = false) {
-  if (!cleanStr || cleanStr.length === 0) return false;
-  if (bw < 5 || bh < 6 || bh > 140) return false;
-  // Filter pure punctuation noise
-  if (!/[A-Za-z0-9\u4e00-\u9fa5]/.test(cleanStr)) return false;
-
-  const isStructuredId = (
-    /^IOE\d{8,12}$/i.test(cleanStr) ||
-    /^\d{3}-\d{3}-\d{3}$/.test(cleanStr) ||
-    /^C09$/i.test(cleanStr) ||
-    /^\d{2}\/\d{2}\/\d{2,4}$/.test(cleanStr) ||
-    /^\$?\d+[.,]\d{2}$/.test(cleanStr) ||
-    /^(XINGYUAN|ZHU|MAY|2002)$/i.test(cleanStr)
-  );
-  if (isStructuredId) return true;
-  if (isFilteredPass) {
-    return conf >= 68 && /^[A-Za-z0-9\u4e00-\u9fa5]{4,}$/.test(cleanStr);
-  }
-  if (conf >= 72 && cleanStr.length >= 2) return true;
-  if (conf >= 58 && /^[A-Za-z0-9\u4e00-\u9fa5/-]{3,}$/.test(cleanStr)) return true;
-  return false;
-}
-
-// Local Adaptive Contrast Filter that strips security watermarks (blue eagle feathers, red/orange patterns)
-// while keeping crisp dark text strokes for Tesseract
-function buildWatermarkSuppressedCanvas(sourceCanvas) {
-  const w = sourceCanvas.width;
-  const h = sourceCanvas.height;
-  const outCanvas = document.createElement('canvas');
-  outCanvas.width = w;
-  outCanvas.height = h;
-  const ctx = outCanvas.getContext('2d', { willReadFrequently: true });
-  ctx.drawImage(sourceCanvas, 0, 0);
-
-  const imgData = ctx.getImageData(0, 0, w, h);
-  const d = imgData.data;
-
-  const gray = new Float32Array(w * h);
-  for (let i = 0, p = 0; i < d.length; i += 4, p++) {
-    gray[p] = 0.25 * d[i] + 0.55 * d[i + 1] + 0.20 * d[i + 2];
-  }
-
-  // Integral image for fast 23x23 local neighborhood mean
-  const integral = new Float64Array((w + 1) * (h + 1));
-  for (let y = 1; y <= h; y++) {
-    let rowSum = 0;
-    for (let x = 1; x <= w; x++) {
-      rowSum += gray[(y - 1) * w + (x - 1)];
-      integral[y * (w + 1) + x] = integral[(y - 1) * (w + 1) + x] + rowSum;
-    }
-  }
-
-  const R = 11;
-  for (let y = 0; y < h; y++) {
-    const y0 = Math.max(0, y - R);
-    const y1 = Math.min(h, y + R + 1);
-    for (let x = 0; x < w; x++) {
-      const x0 = Math.max(0, x - R);
-      const x1 = Math.min(w, x + R + 1);
-      const count = (x1 - x0) * (y1 - y0);
-      const sum = integral[y1 * (w + 1) + x1]
-                - integral[y0 * (w + 1) + x1]
-                - integral[y1 * (w + 1) + x0]
-                + integral[y0 * (w + 1) + x0];
-      const localMean = sum / count;
-      const val = gray[y * w + x];
-      const diff = localMean - val;
-      const idx = (y * w + x) * 4;
-
-      if (val < 122 && diff > 9) {
-        const clean = Math.max(0, Math.min(255, Math.round(255 - (diff - 5) * 6.5)));
-        d[idx] = clean;
-        d[idx + 1] = clean;
-        d[idx + 2] = clean;
-      } else {
-        d[idx] = 255;
-        d[idx + 1] = 255;
-        d[idx + 2] = 255;
-      }
-    }
-  }
-
-  ctx.putImageData(imgData, 0, 0);
-  return outCanvas;
+  return String(raw).trim().replace(/^[“"‘'«»~`]+|[”"’'«»~`]+$/g, '');
 }
 
 // Cluster word items in a given reading space into lines
@@ -4336,52 +4399,51 @@ async function runOcrOnCurrentPage(lang = 'eng', forceRescan = false, silentModa
   }
 
   if (typeof Tesseract === 'undefined') {
-    if (!silentModal) showToast('OCR 识别组件正在加载，请稍候重试，或直接使用底部「框选无痕改字」', 'warning');
+    if (!silentModal) showToast('OCR 识别组件正在加载，请稍候重试，或直接使用底部「框选改字」', 'warning');
     return [];
   }
 
   isRunningOcr = true;
-  const langLabel = lang.includes('chi') ? '中英混合' : '英文/证件/账单';
+  const langLabel = lang.includes('chi') ? '中英混合' : '英文/数字文档';
   if (!silentModal) {
     showExportProgress(true, `正在启动智能 OCR (${langLabel}) 识别第 ${pageNum} 页...`);
   }
 
   try {
-    // 1. Use baseScale (1.5x) canvas directly for crisp, exact coordinate alignment with pdfCanvas
+    // Render current page at high-resolution 2.0x scale for strong general OCR accuracy
+    const page = await state.pdfDoc.getPage(pageNum);
+    const ocrScale = 2.0;
+    const ocrViewport = page.getViewport({ scale: ocrScale });
+    const ocrCanvas = document.createElement('canvas');
+    ocrCanvas.width = ocrViewport.width;
+    ocrCanvas.height = ocrViewport.height;
+    const ocrCtx = ocrCanvas.getContext('2d', { willReadFrequently: true });
+    await page.render({ canvasContext: ocrCtx, viewport: ocrViewport }).promise;
+
+    const coordRatio = state.baseScale / ocrScale; // Maps 2.0x OCR coords cleanly back to 1.5x canvas coords
     const baseW = elements.pdfCanvas.width;
     const baseH = elements.pdfCanvas.height;
-    const uprightCanvas = document.createElement('canvas');
-    uprightCanvas.width = baseW;
-    uprightCanvas.height = baseH;
-    const uCtx = uprightCanvas.getContext('2d', { willReadFrequently: true });
-    uCtx.drawImage(elements.pdfCanvas, 0, 0);
 
-    const extractValidWords = (tessResult, scaleRatio = 1.0, isFilteredPass = false) => {
+    const extractWords = (tessResult, ratio, minConf = 28) => {
       const out = [];
       for (const w of (tessResult?.data?.words || [])) {
-        const cleanStr = normalizeOcrToken(w.text);
-        let bw = (w.bbox.x1 - w.bbox.x0) * scaleRatio;
-        const bh = (w.bbox.y1 - w.bbox.y0) * scaleRatio;
+        const cleanStr = cleanOcrToken(w.text);
+        if (!cleanStr) continue;
         const conf = w.confidence !== undefined ? w.confidence : 50;
-        if (!isUsefulOcrToken(cleanStr, conf, bw, bh, isFilteredPass)) continue;
-        let left = w.bbox.x0 * scaleRatio;
-        const right = w.bbox.x1 * scaleRatio;
-        // Clamp excessive left-side bbox stretching caused by stray watermark specks
-        const maxExpectedW = Math.max(bh * 1.4, cleanStr.length * bh * 0.82);
-        if (bw > maxExpectedW) {
-          bw = Math.round(cleanStr.length * bh * 0.62);
-          left = Math.max(0, right - bw);
-        }
-        const top = w.bbox.y0 * scaleRatio;
-        const canvasFontSize = Math.max(9, Math.min(48, Math.round(bh * 0.88)));
+        if (conf < minConf) continue;
+        const bw = (w.bbox.x1 - w.bbox.x0) * ratio;
+        const bh = (w.bbox.y1 - w.bbox.y0) * ratio;
+        if (bw < 4 || bh < 5 || bh > 130) continue;
+        const left = w.bbox.x0 * ratio;
+        const top = w.bbox.y0 * ratio;
         out.push({
           str: cleanStr,
           left,
           top,
           width: bw,
           height: bh,
-          vy: top + bh * 0.82,
-          canvasFontSize,
+          vy: top + bh * 0.85,
+          canvasFontSize: Math.max(9, Math.min(48, Math.round(bh * 0.94))),
           conf,
           isOcr: true,
         });
@@ -4389,78 +4451,35 @@ async function runOcrOnCurrentPage(lang = 'eng', forceRescan = false, silentModa
       return out;
     };
 
-    const mergeWordLists = (primaryList, secondaryList) => {
-      const merged = [...primaryList];
-      for (const cand of secondaryList) {
-        const overlaps = merged.some(existing => {
-          const xOverlap = Math.max(0, Math.min(existing.left + existing.width, cand.left + cand.width) - Math.max(existing.left, cand.left));
-          const yOverlap = Math.max(0, Math.min(existing.top + existing.height, cand.top + cand.height) - Math.max(existing.top, cand.top));
-          const minArea = Math.min(existing.width * existing.height, cand.width * cand.height);
-          return minArea > 0 && (xOverlap * yOverlap) / minArea > 0.35;
-        });
-        if (!overlaps) {
-          merged.push(cand);
-        }
-      }
-      return merged;
-    };
-
-    // 2. First pass: 0° upright recognition
-    const res0 = await Tesseract.recognize(uprightCanvas, lang, {
+    // Pass 1: Crisp 2.0x upright document recognition
+    const res0 = await Tesseract.recognize(ocrCanvas, lang, {
       logger: (m) => {
         if (!silentModal && m && m.status && m.status.includes('recognizing')) {
           const pct = typeof m.progress === 'number' ? Math.round(m.progress * 100) : 0;
-          showExportProgress(true, `正在智能识别页面文字与编号... ${pct}%`);
+          showExportProgress(true, `正在识别图中文字与排版坐标... ${pct}%`);
         }
       },
     });
-    let uprightWords = extractValidWords(res0, 1.0, false);
-
-    const countStrongTokens = (words) => words.filter(w =>
-      /^IOE\d{8,12}$/i.test(w.str) ||
-      /^\d{3}-\d{3}-\d{3}$/.test(w.str) ||
-      /^\d{2}\/\d{2}\/\d{2,4}$/.test(w.str) ||
-      (w.conf >= 75 && w.str.length >= 4)
-    ).length;
-
-    const uprightStrongCount = countStrongTokens(uprightWords);
-
+    const uprightWords = extractWords(res0, coordRatio, 28);
     let finalLines = [];
 
-    // 3. Check if the scanned document/card inside the PDF is rotated 90° CCW (sideways vertical text, like EAD_Xingyuan_Zhu.pdf)
-    if (uprightStrongCount < 3) {
-      if (!silentModal) {
-        showExportProgress(true, '检测到横置/竖排扫描证件与防伪底纹，正在自动转正并深度去底纹识别...');
-      }
-      // Build +90° CW rotated canvas (width = baseH, height = baseW)
+    // Pass 2: General +90 deg CW fallback ONLY when upright yields very few tokens (e.g. sideways landscape table/scan)
+    if (uprightWords.length < 4) {
       const rot90Canvas = document.createElement('canvas');
-      rot90Canvas.width = baseH;
-      rot90Canvas.height = baseW;
+      rot90Canvas.width = ocrCanvas.height;
+      rot90Canvas.height = ocrCanvas.width;
       const rCtx = rot90Canvas.getContext('2d', { willReadFrequently: true });
-      rCtx.translate(baseH, 0);
+      rCtx.translate(rot90Canvas.width, 0);
       rCtx.rotate(Math.PI / 2);
-      rCtx.drawImage(uprightCanvas, 0, 0);
+      rCtx.drawImage(ocrCanvas, 0, 0);
       rCtx.setTransform(1, 0, 0, 1, 0, 0);
 
-      // Run both watermark-suppressed pass (captures IOE0914412232, C09, 221-556-390, dates over eagle feathers)
-      // and raw pass (captures XINGYUAN, ZHU, headers)
-      const cleanRot90 = buildWatermarkSuppressedCanvas(rot90Canvas);
-      const [resRotClean, resRotRaw] = await Promise.all([
-        Tesseract.recognize(cleanRot90, lang),
-        Tesseract.recognize(rot90Canvas, lang),
-      ]);
+      const resRot = await Tesseract.recognize(rot90Canvas, lang);
+      const rotWords = extractWords(resRot, coordRatio, 35);
 
-      const rotWordsClean = extractValidWords(resRotClean, 1.0, true);
-      const rotWordsRaw = extractValidWords(resRotRaw, 1.0, false);
-      const mergedRotWords = mergeWordLists(rotWordsClean, rotWordsRaw);
-
-      if (countStrongTokens(mergedRotWords) > uprightStrongCount || mergedRotWords.length > uprightWords.length) {
-        const rotClustered = clusterOcrWordsIntoLines(mergedRotWords);
+      if (rotWords.length > uprightWords.length) {
+        const rotClustered = clusterOcrWordsIntoLines(rotWords);
         rotClustered.forEach((rLine, idx) => {
-          // Map +90° CW reading coordinates (rx0, ry0, rx1, ry1) back to unrotated pdfCanvas (baseW x baseH):
-          // Forward +90° CW mapped (x, y) -> (rx = baseH - y, ry = x).
-          // Therefore inverse mapping back to pdfCanvas is:
-          // x = ry, y = baseH - rx!
           const rx0 = rLine.left;
           const ry0 = rLine.top;
           const rx1 = rLine.left + rLine.width;
@@ -4468,9 +4487,9 @@ async function runOcrOnCurrentPage(lang = 'eng', forceRescan = false, silentModa
 
           const boxLeft = Math.max(0, Math.round(ry0));
           const boxTop = Math.max(0, Math.round(baseH - rx1));
-          const boxWidth = Math.max(8, Math.round(ry1 - ry0));   // Vertical line's thickness on pdfCanvas
-          const boxHeight = Math.max(10, Math.round(rx1 - rx0)); // Vertical line's length on pdfCanvas
-          const fontSize = Math.max(10, Math.min(44, Math.round(boxWidth * 0.88)));
+          const boxWidth = Math.max(8, Math.round(ry1 - ry0));
+          const boxHeight = Math.max(10, Math.round(rx1 - rx0));
+          const fontSize = Math.max(10, Math.min(44, Math.round(boxWidth * 0.90)));
 
           finalLines.push({
             id: `ocr_rot_p${pageNum}_${idx}`,
@@ -4485,7 +4504,7 @@ async function runOcrOnCurrentPage(lang = 'eng', forceRescan = false, silentModa
             angle: -90,
             canvasFontSize: fontSize,
             pdfFontSize: Math.round(fontSize / state.baseScale),
-            isBold: /^[A-Z0-9/-]{3,}$/.test(rLine.text) || rLine.text.includes('IOE'),
+            isBold: false,
             fontFamily: 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
             isOcr: true,
           });
@@ -4493,14 +4512,7 @@ async function runOcrOnCurrentPage(lang = 'eng', forceRescan = false, silentModa
       }
     }
 
-    // If upright still has few words and wasn't rotated, also try watermark-suppressed upright
-    if (finalLines.length === 0 && uprightWords.length < 8) {
-      const clean0 = buildWatermarkSuppressedCanvas(uprightCanvas);
-      const res0Clean = await Tesseract.recognize(clean0, lang);
-      uprightWords = mergeWordLists(extractValidWords(res0Clean, 1.0, true), uprightWords);
-    }
-
-    // 4. If upright orientation produced valid lines, refine and store them
+    // Refine upright OCR lines using pixel ink bounds
     if (finalLines.length === 0 && uprightWords.length > 0) {
       const clusteredLines = clusterOcrWordsIntoLines(uprightWords);
       clusteredLines.forEach((line, idx) => {
@@ -4509,7 +4521,7 @@ async function runOcrOnCurrentPage(lang = 'eng', forceRescan = false, silentModa
         const inkBounds = detectInkBoundsInBox(line.left, line.top, line.width, line.height, colors.bgColor);
         const refinedTop = inkBounds ? inkBounds.inkTop : line.top;
         const refinedHeight = inkBounds ? Math.max(8, inkBounds.inkHeight) : line.height;
-        const refinedFontSize = Math.max(9, Math.min(48, Math.round(refinedHeight * 0.96)));
+        const refinedFontSize = Math.max(9, Math.min(48, Math.round(refinedHeight * 1.0)));
 
         finalLines.push({
           id: `ocr_p${pageNum}_${idx}`,
@@ -4540,19 +4552,19 @@ async function runOcrOnCurrentPage(lang = 'eng', forceRescan = false, silentModa
       showExportProgress(false);
       setTool('tap-edit');
       if (finalLines.length > 0) {
-        showToast(`✨ 深度识别完成！共定位 ${finalLines.length} 处文字/编号，直接点击或用「一键替换」即可无痕修改！`, 'success');
+        showToast(`✨ 识别完成！共定位 ${finalLines.length} 处文字，直接点击即可编辑或一键替换！`, 'success');
         if (window.confetti) {
-          window.confetti({ particleCount: 55, spread: 65, origin: { y: 0.75 } });
+          window.confetti({ particleCount: 45, spread: 65, origin: { y: 0.75 } });
         }
       } else {
-        showToast('未识别出清晰文字，您可直接使用底部「框选无痕改字」拖拽修改任意位置', 'warning');
+        showToast('未识别出清晰文字，请尝试点击「旋转」转正或使用底部「框选改字」', 'warning');
       }
     }
     return finalLines;
   } catch (err) {
     if (!silentModal) showExportProgress(false);
     console.error('OCR error:', err);
-    if (!silentModal) showToast('OCR 识别失败: ' + err.message + '，可使用底部「框选无痕改字」', 'error');
+    if (!silentModal) showToast('OCR 识别失败: ' + err.message + '，可使用底部「框选改字」', 'error');
     return [];
   } finally {
     isRunningOcr = false;
@@ -4571,6 +4583,7 @@ window.runOcrOnCurrentPage = runOcrOnCurrentPage;
 window.rotateCurrentPage90 = rotateCurrentPage90;
 window.buildMaskSeamlessPatch = buildMaskSeamlessPatch;
 window.renderReplaceDetectedChips = renderReplaceDetectedChips;
+window.undoLastAction = undoLastAction;
 
 // Initialize Application
 function initApp() {
@@ -4578,6 +4591,10 @@ function initApp() {
   initSignatureBoard();
   setupTouchAndPan();
   checkPendingDraftOnStartup();
+
+  window.addEventListener('unhandledrejection', (e) => {
+    console.error('Unhandled async error:', e.reason);
+  });
 }
 
 if (document.readyState === 'loading') {

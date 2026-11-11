@@ -4,7 +4,12 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes, viewport-fit=cover">
   <title>MobilePDF - 移动端 PDF 原样修改与解密工具</title>
-  <meta name="description" content="专为手机端与桌面端设计的纯前端 PDF 原样修改 Web App，支持密码解锁、遮盖改字、签名批注与无密码解密导出">
+  <meta name="description" content="专为手机端与桌面端设计的纯前端 PDF 修改与解密工具，支持密码解锁、文本编辑、手写签名、隐私打码与扫描件 OCR 识别，100% 本地浏览器处理。">
+  <meta name="theme-color" content="#2563eb">
+  <meta property="og:title" content="MobilePDF - 纯前端 PDF 编辑与解密工具">
+  <meta property="og:description" content="纯本地浏览器运行，不上传服务器。支持合同/表单改字、密码解锁导出、电子签名、隐私涂黑打码与扫描件 OCR。">
+  <meta property="og:type" content="website">
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232563eb'/%3E%3Ctext x='50%25' y='56%25' text-anchor='middle' fill='white' font-size='28' font-family='Arial,sans-serif' font-weight='bold'%3EPDF%3C/text%3E%3C/svg%3E">
   
   <!-- Tailwind CSS -->
   <script src="https://cdn.tailwindcss.com"></script>
@@ -65,9 +70,9 @@
       <button id="btn-prev-page" class="w-8 h-8 rounded-full flex items-center justify-center text-slate-700 hover:bg-white active:bg-slate-200 transition disabled:opacity-30 disabled:pointer-events-none" title="上一页">
         <i class="fa-solid fa-chevron-left text-xs"></i>
       </button>
-      <div class="px-2 text-xs font-semibold text-slate-700 whitespace-nowrap">
+      <button id="btn-page-jump" type="button" class="px-2 text-xs font-semibold text-slate-700 hover:text-blue-600 whitespace-nowrap rounded transition" title="点击快速跳转到指定页码">
         <span id="current-page-num">1</span> / <span id="total-page-num">1</span>
-      </div>
+      </button>
       <button id="btn-next-page" class="w-8 h-8 rounded-full flex items-center justify-center text-slate-700 hover:bg-white active:bg-slate-200 transition disabled:opacity-30 disabled:pointer-events-none" title="下一页">
         <i class="fa-solid fa-chevron-right text-xs"></i>
       </button>
@@ -178,17 +183,17 @@
   <!-- Scanned Image Detected / OCR Quick Action Banner -->
   <div id="scan-detected-banner" class="hidden bg-gradient-to-r from-amber-600 via-orange-600 to-amber-600 text-white px-3 py-1.5 text-xs flex flex-wrap items-center justify-between gap-2 shadow-sm z-20 shrink-0">
     <div class="flex items-center space-x-2 min-w-0">
-      <span class="bg-white/25 px-1.5 py-0.5 rounded text-[10px] font-bold shrink-0">扫描件无痕模式</span>
-      <span id="scan-banner-text" class="truncate">检测到本页为纯扫描图片！已自动开启「纸张纹理无痕修复」，可一键 OCR 识字或直接用「框选改字」：</span>
+      <span class="bg-white/25 px-1.5 py-0.5 rounded text-[10px] font-bold shrink-0">扫描件模式</span>
+      <span id="scan-banner-text" class="truncate">检测到本页为扫描图片或纯图像页，可一键识别文字、框选编辑或进行隐私打码：</span>
     </div>
     <div class="flex items-center space-x-1.5 shrink-0">
       <button id="btn-scan-rotate" class="px-2.5 py-1 bg-indigo-900/80 hover:bg-indigo-900 text-white font-semibold rounded shadow-sm active:scale-95 transition text-[11px] flex items-center space-x-1" title="如果扫描件方向是横着的，点击顺时针旋转 90° 转正">
         <i class="fa-solid fa-rotate-right"></i>
         <span>旋转转正</span>
       </button>
-      <button id="btn-ocr-fast-eng" class="px-2.5 py-1 bg-white text-amber-800 font-bold rounded shadow-sm hover:bg-amber-50 active:scale-95 transition text-[11px] flex items-center space-x-1" title="极速识别英文、数字、账单、日期与证件号（支持自动识别竖排90°文字）">
+      <button id="btn-ocr-fast-eng" class="px-2.5 py-1 bg-white text-amber-800 font-bold rounded shadow-sm hover:bg-amber-50 active:scale-95 transition text-[11px] flex items-center space-x-1" title="识别英文、数字、账单、日期与表格文字">
         <i class="fa-solid fa-bolt text-amber-600"></i>
-        <span>识别英文/数字/证件</span>
+        <span>识别英文/数字</span>
       </button>
       <button id="btn-ocr-chi-eng" class="px-2.5 py-1 bg-amber-900/70 hover:bg-amber-900 text-white font-semibold rounded shadow-sm active:scale-95 transition text-[11px] flex items-center space-x-1" title="识别中文+英文混合扫描文档">
         <i class="fa-solid fa-language"></i>
@@ -260,6 +265,15 @@
           </button>
         </div>
       </div>
+
+      <!-- Privacy & Compliance Notice -->
+      <div class="mt-5 pt-4 border-t border-slate-100 text-[11px] text-slate-500 bg-slate-50/80 rounded-xl p-3 text-left leading-relaxed">
+        <div class="font-semibold text-slate-700 mb-0.5 flex items-center space-x-1.5">
+          <i class="fa-solid fa-shield-halved text-emerald-600"></i>
+          <span>隐私安全与合规使用声明</span>
+        </div>
+        <p>所有文档解析、OCR 识别与 PDF 导出均 100% 在本地浏览器内完成，绝不上传任何服务器。本工具仅用于合法的个人/办公文档编辑、签署、表单填写及隐私打码，严禁用于伪造或篡改身份证件、官方证明或法律金融票据。</p>
+      </div>
     </div>
 
     <!-- Active PDF Canvas Stage -->
@@ -281,6 +295,15 @@
   <div id="contextual-property-bar" class="hidden fixed bottom-[72px] sm:bottom-[76px] left-1/2 -translate-x-1/2 z-30 bg-slate-900/90 text-white backdrop-blur-md px-3 py-1.5 rounded-full shadow-xl flex items-center space-x-2 text-xs border border-slate-700/60 transition-all max-w-[94vw] overflow-x-auto">
     <!-- Text Controls -->
     <div id="text-prop-controls" class="flex items-center space-x-2 shrink-0">
+      <select id="select-font-family" class="bg-slate-800 text-slate-100 border border-slate-700 rounded px-1.5 py-0.5 text-[11px] focus:outline-none focus:ring-1 focus:ring-blue-500" title="切换字体族以匹配原文档">
+        <option value='system-ui, -apple-system, "Segoe UI", Roboto, sans-serif'>默认无衬线</option>
+        <option value="Arial, Helvetica, sans-serif">Arial / 黑体</option>
+        <option value='Georgia, Cambria, "Times New Roman", Times, serif'>衬线 / 宋体</option>
+        <option value="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace">等宽字体</option>
+      </select>
+
+      <div class="h-3.5 w-px bg-slate-700 mx-0.5"></div>
+
       <span class="text-slate-400 text-[11px]">字号:</span>
       <button id="btn-font-minus" class="w-6 h-6 rounded-full bg-slate-800 hover:bg-slate-700 active:bg-slate-600 flex items-center justify-center text-[10px]">
         <i class="fa-solid fa-minus"></i>
@@ -301,17 +324,18 @@
       <div class="h-3.5 w-px bg-slate-700 mx-1"></div>
 
       <button id="btn-text-bold" class="w-6 h-6 rounded bg-slate-800 hover:bg-slate-700 flex items-center justify-center font-bold text-xs" title="加粗">B</button>
+      <button id="btn-text-italic" class="w-6 h-6 rounded bg-slate-800 hover:bg-slate-700 flex items-center justify-center italic font-serif text-xs" title="斜体">I</button>
       <div class="h-3.5 w-px bg-slate-700 mx-1"></div>
 
       <!-- Linked Mask / Background Color -->
       <div id="text-bg-prop-controls" class="hidden items-center space-x-1">
         <span class="text-slate-400 text-[11px]">底色:</span>
         <input type="color" id="input-text-bg-color" class="w-5 h-5 rounded-full bg-transparent border-0 cursor-pointer p-0" title="自选纯色底色遮罩" value="#ffffff">
-        <button id="btn-restore-seamless-mask" class="px-1.5 py-0.5 rounded bg-emerald-600/80 hover:bg-emerald-500 text-white text-[10px] font-medium transition" title="恢复纸张纹理无痕融合底色（自动消除色块痕迹）">
-          无痕底纹
+        <button id="btn-restore-seamless-mask" class="px-1.5 py-0.5 rounded bg-emerald-600/80 hover:bg-emerald-500 text-white text-[10px] font-medium transition" title="匹配原文档纸张底色与平滑渐变">
+          纸底匹配
         </button>
-        <button id="btn-toggle-scan-blend" class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-[10px] font-medium transition" title="切换扫描件墨迹边缘柔化效果，让新字融入扫描纸张">
-          墨迹柔化
+        <button id="btn-toggle-scan-blend" class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-[10px] font-medium transition" title="切换扫描文档轻微墨迹柔化效果">
+          打印柔化
         </button>
         <div class="h-3.5 w-px bg-slate-700 mx-1"></div>
       </div>
@@ -322,12 +346,13 @@
       </button>
     </div>
 
-    <!-- Mask Controls -->
+    <!-- Mask / Privacy Redaction Controls -->
     <div id="mask-prop-controls" class="hidden flex items-center space-x-2 shrink-0">
-      <span class="text-slate-400 text-[11px]">遮罩颜色:</span>
-      <button class="w-5 h-5 rounded-full bg-white border border-slate-300 mask-color-swatch" data-color="#ffffff" title="纯白"></button>
-      <button class="w-5 h-5 rounded-full bg-slate-100 border border-slate-300 mask-color-swatch" data-color="#f8fafc" title="纸灰"></button>
-      <button class="w-5 h-5 rounded-full bg-amber-50 border border-slate-300 mask-color-swatch" data-color="#fef3c7" title="微黄"></button>
+      <span class="text-slate-400 text-[11px]">遮罩/打码:</span>
+      <button class="w-5 h-5 rounded-full bg-white border border-slate-300 mask-color-swatch" data-color="#ffffff" title="纯白覆盖"></button>
+      <button class="w-5 h-5 rounded-full bg-slate-100 border border-slate-300 mask-color-swatch" data-color="#f8fafc" title="纸灰覆盖"></button>
+      <button class="w-5 h-5 rounded-full bg-amber-50 border border-slate-300 mask-color-swatch" data-color="#fef3c7" title="微黄纸张"></button>
+      <button class="w-5 h-5 rounded-full bg-black border border-white/60 mask-color-swatch" data-color="#000000" title="隐私涂黑打码（遮挡敏感信息）"></button>
       <input type="color" id="input-mask-color" class="w-5 h-5 rounded-full bg-transparent border-0 cursor-pointer p-0" title="自选遮罩色" value="#ffffff">
     </div>
 
@@ -434,12 +459,12 @@
         <span class="text-[10px] font-medium leading-none">画笔涂鸦</span>
       </button>
 
-      <!-- Tool 6: Pure Mask / Eraser -->
-      <button id="tool-mask" class="toolbar-btn flex flex-col items-center justify-center min-w-[56px] py-1 px-1.5 rounded-xl transition text-slate-600 hover:text-blue-600" data-tool="mask">
+      <!-- Tool 6: Pure Mask / Privacy Redaction -->
+      <button id="tool-mask" class="toolbar-btn flex flex-col items-center justify-center min-w-[56px] py-1 px-1.5 rounded-xl transition text-slate-600 hover:text-blue-600" data-tool="mask" title="纯色遮罩 / 隐私涂黑打码：框选遮挡不需要或敏感的区域">
         <div class="w-8 h-8 rounded-full flex items-center justify-center text-sm mb-0.5 tool-icon-bg">
           <i class="fa-regular fa-square"></i>
         </div>
-        <span class="text-[10px] font-medium leading-none">纯色遮罩</span>
+        <span class="text-[10px] font-medium leading-none">遮罩打码</span>
       </button>
 
       <!-- Tool 7: Insert Image -->
@@ -711,9 +736,9 @@
               <i class="fa-solid fa-wand-magic-sparkles text-amber-600"></i>
               <span>本页已识别编号/文字 (点击直接填入)：</span>
             </span>
-            <button id="btn-rescan-in-replace" type="button" class="px-2 py-0.5 bg-amber-600 hover:bg-amber-700 text-white rounded text-[10px] font-semibold transition flex items-center gap-1 shadow-sm" title="对当前扫描 PDF 页面重新运行深度去底纹 OCR 识别">
+            <button id="btn-rescan-in-replace" type="button" class="px-2 py-0.5 bg-amber-600 hover:bg-amber-700 text-white rounded text-[10px] font-semibold transition flex items-center gap-1 shadow-sm" title="对当前扫描文档页面重新运行 OCR 识字">
               <i class="fa-solid fa-eye"></i>
-              <span>深度OCR识字</span>
+              <span>重新OCR识字</span>
             </button>
           </div>
           <div id="replace-detected-chips" class="flex flex-wrap gap-1 max-h-20 overflow-y-auto pt-0.5">
@@ -725,7 +750,7 @@
         <div id="replace-preview-container" class="hidden">
           <p class="text-xs font-semibold text-slate-500 mb-1 flex items-center justify-between">
             <span>匹配预览 (前 5 条)：</span>
-            <span id="replace-preview-hint" class="text-[10px] text-slate-400">将自动转换为无痕文本框并保留原方向与字重</span>
+            <span id="replace-preview-hint" class="text-[10px] text-slate-400">将自动转换为可编辑文本框并匹配原文档字号与样式</span>
           </p>
           <div id="replace-preview-list" class="max-h-24 overflow-y-auto space-y-1 text-xs text-slate-600 bg-slate-50 rounded-lg p-2 border border-slate-200 font-mono">
           </div>
@@ -753,6 +778,6 @@
   </div>
 
   <!-- Application Logic -->
-  <script src="app.js?v=20261110v8"></script>
+  <script src="app.js?v=20261110v9"></script>
 </body>
 </html>
