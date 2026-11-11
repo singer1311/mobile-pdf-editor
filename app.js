@@ -4489,11 +4489,13 @@ function buildScannerContrastCanvas(sourceCanvas) {
                 - integral[y1 * (w + 1) + x0]
                 + integral[y0 * (w + 1) + x0];
       const localMean = sum / cnt;
-      const diff = localMean - lum[y * w + x];
+      const valLum = lum[y * w + x];
+      const diff = localMean - valLum;
       const p = y * w + x;
 
-      if (diff > 8) {
-        const val = Math.max(0, Math.min(255, Math.round(255 - (diff - 5) * 7.2)));
+      // Require >= 20 contrast diff (ignores faint ledger grid lines & paper grain) and real ink darkness (prevents pastel/shaded header borders turning black)
+      if (diff > 20 && valLum < 158) {
+        const val = Math.max(0, Math.min(255, Math.round(255 - (diff - 12) * 6.5)));
         outGray[p] = val;
         if (val < 165) inkMap[p] = 1;
       } else {
@@ -4502,7 +4504,7 @@ function buildScannerContrastCanvas(sourceCanvas) {
     }
   }
 
-  // Soft morphological stroke-gap closing: bridge tiny 1-2px toner dropouts inside broken strokes
+  // Gentle 3x3 stroke-gap bridging strictly at tiny 1-2px toner dropouts without blobbing thin grid lines
   for (let y = 1; y < h - 1; y++) {
     for (let x = 1; x < w - 1; x++) {
       const p = y * w + x;
@@ -4520,7 +4522,7 @@ function buildScannerContrastCanvas(sourceCanvas) {
             }
           }
         }
-        if (darkNeighbors >= 4) {
+        if (darkNeighbors >= 5) {
           val = Math.min(val, Math.round((val + minNeighbor * 2) / 3));
         }
       }
@@ -4682,8 +4684,8 @@ async function runOcrOnCurrentPage(lang = 'eng', forceRescan = false, silentModa
     const enhCanvas = buildScannerContrastCanvas(ocrCanvas);
     const resEnh = await Tesseract.recognize(enhCanvas, lang);
     const enhWords = extractWords(resEnh, coordRatio, 30);
-    // Prefer enhanced-pass tokens cleanly alongside raw tokens
-    uprightWords = mergeWordPasses(enhWords, uprightWords);
+    // Keep high-confidence raw words as primary baseline, supplementing shaded/faded words cleanly from enhanced pass
+    uprightWords = mergeWordPasses(uprightWords, enhWords);
 
     let finalLines = [];
 
