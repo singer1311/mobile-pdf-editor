@@ -301,14 +301,14 @@ function buildMaskSeamlessPatch(maskObj, sourcePdfCanvas = null, coordScale = 1.
       }
     }
 
-    // Detect ink strokes vs clean background pattern, dilate by 3px with soft feathering, and run harmonic Laplace diffusion!
+    // Detect ink strokes (including soft blurry halos) vs background pattern, dilate softly, and run harmonic diffusion
     const rawInk = new Uint8Array(bw * bh);
     for (let p = 0; p < bw * bh; p++) {
       const i = p * 4;
       const r = srcData[i], g = srcData[i + 1], b = srcData[i + 2];
       const dist = Math.abs(r - expBgR[p]) + Math.abs(g - expBgG[p]) + Math.abs(b - expBgB[p]);
       const darkDiff = (expBgR[p] - r) + (expBgG[p] - g) + (expBgB[p] - b);
-      if (darkDiff > 38 || dist > 48 || (r < 108 && g < 108 && b < 108 && darkDiff > 24)) {
+      if (darkDiff > 28 || dist > 42 || (r < 108 && g < 108 && b < 108 && darkDiff > 20)) {
         rawInk[p] = 1;
       }
     }
@@ -1572,35 +1572,51 @@ async function createAndSelectBoxWithLocalOcr(left, top, width, height, enterEdi
         cropCanvas.height = Math.max(16, Math.round(height * 1.5));
         cropCanvas.getContext('2d').drawImage(elements.pdfCanvas, left, top, width, height, 0, 0, cropCanvas.width, cropCanvas.height);
       }
-      const res = await Tesseract.recognize(cropCanvas, 'eng');
-      const rawTxt = (res?.data?.text || '').replace(/\s+/g, ' ').trim();
-      const normTxt = cleanOcrToken(rawTxt);
+      // Run local crop OCR cleanly, falling back to contrast-enhanced pass for shaded/broken scans
+      let res = await Tesseract.recognize(cropCanvas, 'eng');
+      let rawTxt = (res?.data?.text || '').replace(/\s+/g, ' ').trim();
+      let normTxt = cleanOcrToken(rawTxt);
+      const meanConf = (res?.data?.words || []).reduce((s, w) => s + (w.confidence || 0), 0) / Math.max(1, (res?.data?.words || []).length);
+      if ((!normTxt || meanConf < 60) && typeof buildScannerContrastCanvas === 'function') {
+        const enhCrop = buildScannerContrastCanvas(cropCanvas);
+        const resEnh = await Tesseract.recognize(enhCrop, 'eng');
+        const enhTxt = cleanOcrToken((resEnh?.data?.text || '').replace(/\s+/g, ' ').trim());
+        if (enhTxt && (enhTxt.length > normTxt.length || !normTxt)) {
+          normTxt = enhTxt;
+        }
+      }
       if (normTxt) prefillText = normTxt;
     } catch (e) {}
   }
 
   if (!prefillText) prefillText = '点击输入修改文字';
 
+  const defaultFontFamily = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+  const detectedBold = inkBounds ? inkBounds.isBold : Boolean(colors.isBoldInk || state.isBold);
+
   let calculatedFontSize, textLeft, textTop, initialWidth;
   if (isVerticalBox) {
     const charH = (inkBounds && inkBounds.inkWidth >= 6) ? inkBounds.inkWidth : width;
-    calculatedFontSize = Math.max(10, Math.min(Math.round(charH * 0.85), 52));
-    textLeft = (inkBounds && inkBounds.inkWidth >= 6) ? inkBounds.inkLeft : left;
+    const cal = calibrateTextboxToInkBounds(prefillText, inkBounds ? inkBounds.inkLeft : left, charH, defaultFontFamily, detectedBold ? 'bold' : 'normal');
+    calculatedFontSize = cal.fontSize;
+    textLeft = Math.max(left - 2, cal.top);
     textTop = top + height;
     initialWidth = Math.max(height + 20, 80);
   } else {
     const hasTightInk = inkBounds && inkBounds.inkHeight >= 6;
-    calculatedFontSize = hasTightInk
-      ? Math.max(10, Math.min(Math.round(inkBounds.inkHeight * 1.02), 48))
-      : Math.max(12, Math.min(Math.round(height * 0.72), 48));
-    textLeft = hasTightInk ? inkBounds.inkLeft : left;
-    textTop = hasTightInk
-      ? Math.max(top, Math.round(inkBounds.inkTop - calculatedFontSize * 0.08))
-      : top + Math.max(0, (height - calculatedFontSize * 1.18) / 2);
+    if (hasTightInk) {
+      const cal = calibrateTextboxToInkBounds(prefillText, inkBounds.inkTop, inkBounds.inkHeight, defaultFontFamily, detectedBold ? 'bold' : 'normal');
+      calculatedFontSize = cal.fontSize;
+      textLeft = inkBounds.inkLeft;
+      textTop = cal.top;
+    } else {
+      calculatedFontSize = Math.max(12, Math.min(Math.round(height * 0.72), 48));
+      textLeft = left;
+      textTop = top + Math.max(0, (height - calculatedFontSize * 1.18) / 2);
+    }
     initialWidth = Math.max(width + 20, 100);
   }
   state.fontSize = calculatedFontSize;
-  const detectedBold = inkBounds ? inkBounds.isBold : Boolean(colors.isBoldInk || state.isBold);
 
   const textbox = new fabric.Textbox(prefillText, {
     left: textLeft,
@@ -1610,7 +1626,7 @@ async function createAndSelectBoxWithLocalOcr(left, top, width, height, enterEdi
     fontSize: calculatedFontSize,
     fill: colors.textColor,
     backgroundColor: 'transparent',
-    fontFamily: 'system-ui, -apple-system, sans-serif',
+    fontFamily: defaultFontFamily,
     fontWeight: detectedBold ? 'bold' : 'normal',
     splitByGrapheme: true,
     editable: true,
@@ -1658,7 +1674,31 @@ async function createAndSelectBoxWithLocalOcr(left, top, width, height, enterEdi
   return textbox;
 }
 
-// Detect tight ink bounding box and stroke density inside a dragged region (for pixel-accurate font sizing on scanned images)
+// Calibrate Fabric Textbox fontSize & top coordinate from measured pixel ink height & top edge
+function calibrateTextboxToInkBounds(text, inkTop, inkHeight, fontFamily = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif', fontWeight = 'normal') {
+  const safeH = Math.max(8, Math.min(60, inkHeight || 16));
+  try {
+    if (!_measureCanvas) _measureCanvas = document.createElement('canvas');
+    const ctx = _measureCanvas.getContext('2d');
+    const refFs = 36;
+    ctx.font = `${fontWeight || 'normal'} ${refFs}px ${fontFamily}`;
+    const sample = (text && text.trim() && text !== '点击输入修改文字') ? text.trim().slice(0, 24) : 'H0123';
+    const m = ctx.measureText(sample);
+    const ascent = m.actualBoundingBoxAscent || refFs * 0.72;
+    const descent = m.actualBoundingBoxDescent || 0;
+    const inkHeightRatio = Math.max(0.55, Math.min(1.02, (ascent + descent) / refFs));
+    const topOffsetRatio = Math.max(0.05, Math.min(0.32, 0.91 - (ascent / refFs)));
+
+    const fontSize = Math.max(9, Math.min(54, Math.round(safeH / inkHeightRatio)));
+    const top = Math.round(inkTop - fontSize * topOffsetRatio);
+    return { fontSize, top };
+  } catch (e) {
+    const fs = Math.max(9, Math.min(54, Math.round(safeH * 1.15)));
+    return { fontSize: fs, top: Math.round(inkTop - fs * 0.16) };
+  }
+}
+
+// Detect tight ink bounding box and stroke density using local column background rims (robust to uneven shadows)
 function detectInkBoundsInBox(left, top, width, height, bgHex, sourceCanvas = null) {
   try {
     const pdfCanvas = sourceCanvas || elements.pdfCanvas;
@@ -1671,24 +1711,59 @@ function detectInkBoundsInBox(left, top, width, height, bgHex, sourceCanvas = nu
     const h = Math.min(pdfCanvas.height - t, Math.ceil(height));
     if (w < 4 || h < 4) return null;
 
-    const bg = parseHexRgb(bgHex || '#ffffff');
+    const fallbackBg = parseHexRgb(bgHex || '#ffffff');
     const data = ctx.getImageData(l, t, w, h).data;
 
-    let minX = w, maxX = -1, minY = h, maxY = -1;
+    // Sample top 2 rows & bottom 2 rows per column to resist diagonal illumination / shadow blotches
+    const colBg = new Array(w);
+    for (let x = 0; x < w; x++) {
+      let sr = 0, sg = 0, sb = 0, cnt = 0;
+      const samples = [];
+      for (const ry of [0, 1, Math.max(0, h - 2), h - 1]) {
+        const i = (ry * w + x) * 4;
+        if (data[i + 3] < 80) continue;
+        samples.push({ r: data[i], g: data[i + 1], b: data[i + 2], lum: data[i] + data[i + 1] + data[i + 2] });
+      }
+      if (samples.length > 0) {
+        samples.sort((a, b) => b.lum - a.lum);
+        const keep = samples.slice(0, Math.max(1, Math.ceil(samples.length * 0.75)));
+        keep.forEach(p => { sr += p.r; sg += p.g; sb += p.b; cnt++; });
+        colBg[x] = { r: sr / cnt, g: sg / cnt, b: sb / cnt };
+      } else {
+        colBg[x] = fallbackBg;
+      }
+    }
+
+    const rowCounts = new Int32Array(h);
+    const colCounts = new Int32Array(w);
     let inkPixels = 0;
 
     for (let y = 0; y < h; y++) {
       for (let x = 0; x < w; x++) {
         const i = (y * w + x) * 4;
         if (data[i + 3] < 80) continue;
-        const dist = Math.abs(data[i] - bg.r) + Math.abs(data[i + 1] - bg.g) + Math.abs(data[i + 2] - bg.b);
-        if (dist > 45) {
-          if (x < minX) minX = x;
-          if (x > maxX) maxX = x;
-          if (y < minY) minY = y;
-          if (y > maxY) maxY = y;
+        const cbg = colBg[x];
+        const dist = Math.abs(data[i] - cbg.r) + Math.abs(data[i + 1] - cbg.g) + Math.abs(data[i + 2] - cbg.b);
+        if (dist > 42) {
+          rowCounts[y]++;
+          colCounts[x]++;
           inkPixels++;
         }
+      }
+    }
+
+    // Require >= 2 ink pixels in row/col so isolated scanner dust speckles don't stretch ink bounds
+    let minX = w, maxX = -1, minY = h, maxY = -1;
+    for (let x = 0; x < w; x++) {
+      if (colCounts[x] >= 2) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+      }
+    }
+    for (let y = 0; y < h; y++) {
+      if (rowCounts[y] >= 2) {
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
       }
     }
 
@@ -1703,20 +1778,21 @@ function detectInkBoundsInBox(left, top, width, height, bgHex, sourceCanvas = nu
       inkWidth: inkW,
       inkHeight: inkH,
       inkDensity,
-      isBold: inkDensity > 0.26,
+      isBold: inkDensity > 0.24,
     };
   } catch (e) {
     return null;
   }
 }
 
-// Detect if the text is inside a colored container (e.g. a dark blue header card or pastel callout box) and find its right boundary
+// Detect if text is inside a flat digital colored container (e.g. dark blue vector header card) and find its right border
 function findContainerRightBoundary(left, top, width, maskColor, sourceCanvas = null, height = 14) {
   try {
     const pdfCanvas = sourceCanvas || elements.pdfCanvas;
     if (!pdfCanvas || !maskColor) return 0;
-    // White masks on white paper never visually protrude; allow free expansion over neighboring text
     if (maskColor.toLowerCase() === '#ffffff') return 0;
+    // Scanned/textured pages use column-adaptive seamless inpaint masks, so never artificially truncate width across shadows/stains
+    if (state.isScannedPage[state.currentPage] || state.isImageSource) return 0;
 
     const ctx = pdfCanvas.getContext('2d', { willReadFrequently: true });
 
@@ -1731,7 +1807,6 @@ function findContainerRightBoundary(left, top, width, maskColor, sourceCanvas = 
       return 0;
     }
 
-    // Scan from just inside the left edge so even previously oversized masks snap to the true container edge
     const scanStartX = Math.max(0, Math.round(left + Math.min(width || 12, 12)));
     const maxScanLen = Math.min(600, pdfCanvas.width - scanStartX);
     if (maxScanLen <= 3) return 0;
@@ -1745,13 +1820,13 @@ function findContainerRightBoundary(left, top, width, maskColor, sourceCanvas = 
     const row2 = ctx.getImageData(scanStartX, y2, maxScanLen, 1).data;
     const row3 = ctx.getImageData(scanStartX, y3, maxScanLen, 1).data;
 
+    // Require strong sharp container boundary (> 75 RGB distance) so subtle gradients don't mis-truncate
     const isOutside = (row, idx) => {
       const i = idx * 4;
       const diff = Math.abs(row[i] - targetR) + Math.abs(row[i + 1] - targetG) + Math.abs(row[i + 2] - targetB);
-      return diff > 22;
+      return diff > 75;
     };
 
-    // Require 3 consecutive X columns where top, middle, and bottom all exit the container fill
     for (let i = 0; i < maxScanLen - 2; i++) {
       if (
         isOutside(row1, i) && isOutside(row2, i) && isOutside(row3, i) &&
@@ -1997,10 +2072,10 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
   const measuredW = measureTextLineWidth(line.text, line.canvasFontSize, isBoldFinal ? 'bold' : 'normal', fontFamilyFinal, computedCharSpacing);
   const initialWidth = Math.max(targetSpan + 16, Math.ceil(measuredW + 16), 40);
 
-  // 3. In-place editable Textbox preserving original font size, color, weight, angle, and spacing
+  // 3. In-place editable Textbox preserving original font size, color, weight, angle, and pixel baseline
   const textbox = new fabric.Textbox(line.text, {
     left: isVerticalCcw ? (line.textLeft ?? line.left) : line.left,
-    top: isVerticalCcw ? (line.textTop ?? (line.top + line.height)) : line.top,
+    top: isVerticalCcw ? (line.textTop ?? (line.top + line.height)) : (line.textTop ?? line.top),
     angle: isVerticalCcw ? -90 : 0,
     charSpacing: computedCharSpacing,
     width: initialWidth,
@@ -2360,9 +2435,8 @@ function samplePdfColors(left, top, width, height, sourceCanvas = null) {
       bg = { r: 255, g: 255, b: 255 };
     }
 
-    // 2. Interior contrast sampling for text ink color (prefer core ink pixels dist > 65 so anti-aliased scan fringes don't wash out text)
-    let textR = 0, textG = 0, textB = 0, textCount = 0;
-    let coreR = 0, coreG = 0, coreB = 0, coreCount = 0;
+    // 2. Interior core ink quantile sampling (takes top highest-contrast pixels so blurred anti-aliased fringes don't wash out color)
+    const inkSamples = [];
     let totalSampled = 0;
     for (let i = 0; i < imgData.length; i += stride) {
       const r = imgData[i];
@@ -2373,46 +2447,36 @@ function samplePdfColors(left, top, width, height, sourceCanvas = null) {
       totalSampled++;
 
       const dist = Math.abs(r - bg.r) + Math.abs(g - bg.g) + Math.abs(b - bg.b);
-      if (dist > 45) { // Distinct contrast from background
-        textR += r;
-        textG += g;
-        textB += b;
-        textCount++;
-        if (dist > 70) {
-          coreR += r;
-          coreG += g;
-          coreB += b;
-          coreCount++;
-        }
+      if (dist > 45) {
+        inkSamples.push({ r, g, b, dist });
       }
     }
 
     // Fallback full-pixel check for very thin strokes (e.g. '1', '.', '|') so visible glyphs are never missed
-    if (textCount === 0) {
+    if (inkSamples.length === 0) {
       for (let i = 0; i < imgData.length; i += 4) {
         if (imgData[i + 3] < 80) continue;
         const dist = Math.abs(imgData[i] - bg.r) + Math.abs(imgData[i + 1] - bg.g) + Math.abs(imgData[i + 2] - bg.b);
-        if (dist > 30) {
-          textR += imgData[i];
-          textG += imgData[i + 1];
-          textB += imgData[i + 2];
-          textCount++;
+        if (dist > 28) {
+          inkSamples.push({ r: imgData[i], g: imgData[i + 1], b: imgData[i + 2], dist });
         }
       }
     }
 
+    const textCount = inkSamples.length;
     let text = { r: 17, g: 24, b: 39 }; // Default dark charcoal
-    if (coreCount >= 2) {
+    if (inkSamples.length > 0) {
+      inkSamples.sort((a, b) => b.dist - a.dist);
+      // Skip extreme top 3% JPEG dust outliers and average core high-contrast stroke quantile [3% .. 30%]
+      const startIdx = inkSamples.length >= 20 ? Math.floor(inkSamples.length * 0.03) : 0;
+      const endIdx = Math.max(startIdx + 1, Math.ceil(inkSamples.length * 0.30));
+      const coreSlice = inkSamples.slice(startIdx, endIdx);
+      let sr = 0, sg = 0, sb = 0;
+      coreSlice.forEach(p => { sr += p.r; sg += p.g; sb += p.b; });
       text = {
-        r: Math.round(coreR / coreCount),
-        g: Math.round(coreG / coreCount),
-        b: Math.round(coreB / coreCount),
-      };
-    } else if (textCount > 0) {
-      text = {
-        r: Math.round(textR / textCount),
-        g: Math.round(textG / textCount),
-        b: Math.round(textB / textCount),
+        r: Math.round(sr / coreSlice.length),
+        g: Math.round(sg / coreSlice.length),
+        b: Math.round(sb / coreSlice.length),
       };
     }
 
@@ -4380,6 +4444,97 @@ async function openScannedImageAsPdf(file) {
   }
 }
 
+// General scanned-document contrast & broken-stroke enhancement pass for OCR
+// Normalizes uneven paper shadows/colored tints (31x31 local mean) and lightly bridges faint broken strokes
+function buildScannerContrastCanvas(sourceCanvas) {
+  const w = sourceCanvas.width;
+  const h = sourceCanvas.height;
+  const outCanvas = document.createElement('canvas');
+  outCanvas.width = w;
+  outCanvas.height = h;
+  const ctx = outCanvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(sourceCanvas, 0, 0);
+
+  const imgData = ctx.getImageData(0, 0, w, h);
+  const d = imgData.data;
+
+  const lum = new Float32Array(w * h);
+  for (let i = 0, p = 0; i < d.length; i += 4, p++) {
+    lum[p] = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+  }
+
+  // 31x31 (R = 15) integral image for local illumination estimation
+  const integral = new Float64Array((w + 1) * (h + 1));
+  for (let y = 1; y <= h; y++) {
+    let rowSum = 0;
+    for (let x = 1; x <= w; x++) {
+      rowSum += lum[(y - 1) * w + (x - 1)];
+      integral[y * (w + 1) + x] = integral[(y - 1) * (w + 1) + x] + rowSum;
+    }
+  }
+
+  const R = 15;
+  const inkMap = new Uint8Array(w * h);
+  const outGray = new Uint8ClampedArray(w * h);
+
+  for (let y = 0; y < h; y++) {
+    const y0 = Math.max(0, y - R);
+    const y1 = Math.min(h, y + R + 1);
+    for (let x = 0; x < w; x++) {
+      const x0 = Math.max(0, x - R);
+      const x1 = Math.min(w, x + R + 1);
+      const cnt = (x1 - x0) * (y1 - y0);
+      const sum = integral[y1 * (w + 1) + x1]
+                - integral[y0 * (w + 1) + x1]
+                - integral[y1 * (w + 1) + x0]
+                + integral[y0 * (w + 1) + x0];
+      const localMean = sum / cnt;
+      const diff = localMean - lum[y * w + x];
+      const p = y * w + x;
+
+      if (diff > 8) {
+        const val = Math.max(0, Math.min(255, Math.round(255 - (diff - 5) * 7.2)));
+        outGray[p] = val;
+        if (val < 165) inkMap[p] = 1;
+      } else {
+        outGray[p] = 255;
+      }
+    }
+  }
+
+  // Soft morphological stroke-gap closing: bridge tiny 1-2px toner dropouts inside broken strokes
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const p = y * w + x;
+      let val = outGray[p];
+      if (!inkMap[p]) {
+        let darkNeighbors = 0;
+        let minNeighbor = 255;
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const np = (y + dy) * w + (x + dx);
+            if (inkMap[np]) {
+              darkNeighbors++;
+              if (outGray[np] < minNeighbor) minNeighbor = outGray[np];
+            }
+          }
+        }
+        if (darkNeighbors >= 4) {
+          val = Math.min(val, Math.round((val + minNeighbor * 2) / 3));
+        }
+      }
+      const idx = p * 4;
+      d[idx] = val;
+      d[idx + 1] = val;
+      d[idx + 2] = val;
+    }
+  }
+
+  ctx.putImageData(imgData, 0, 0);
+  return outCanvas;
+}
+
 // Trim stray surrounding whitespace and punctuation artifacts on general OCR tokens
 function cleanOcrToken(raw) {
   if (!raw) return '';
@@ -4405,8 +4560,8 @@ function clusterOcrWordsIntoLines(wordItems) {
     }
     const sameBaseline = Math.abs(current.vy - item.vy) <= Math.max(6, item.height * 0.48);
     const xGap = item.left - (current.left + current.width);
-    const sameSize = Math.abs(current.canvasFontSize - item.canvasFontSize) <= 5;
-    const isClose = (xGap >= -6 && xGap <= Math.min(22, item.height * 1.35));
+    const sameSize = Math.abs(current.canvasFontSize - item.canvasFontSize) <= 6;
+    const isClose = (xGap >= -6 && xGap <= Math.min(26, item.height * 1.45));
 
     if (sameBaseline && sameSize && isClose) {
       const isCjk = /[\u4e00-\u9fa5]/.test(current.text.slice(-1)) && /[\u4e00-\u9fa5]/.test(item.str[0]);
@@ -4470,6 +4625,7 @@ async function runOcrOnCurrentPage(lang = 'eng', forceRescan = false, silentModa
       for (const w of (tessResult?.data?.words || [])) {
         const cleanStr = cleanOcrToken(w.text);
         if (!cleanStr) continue;
+        if (!/[A-Za-z0-9\u4e00-\u9fa5$#¥€£%+-]/.test(cleanStr)) continue;
         const conf = w.confidence !== undefined ? w.confidence : 50;
         if (conf < minConf) continue;
         const bw = (w.bbox.x1 - w.bbox.x0) * ratio;
@@ -4492,8 +4648,27 @@ async function runOcrOnCurrentPage(lang = 'eng', forceRescan = false, silentModa
       return out;
     };
 
+    // Merge words across passes: keep higher-confidence / cleaner token when bounding boxes overlap
+    const mergeWordPasses = (primaryList, secondaryList) => {
+      const merged = [...primaryList];
+      for (const cand of secondaryList) {
+        const overlapIdx = merged.findIndex(ex => {
+          const ox = Math.max(0, Math.min(ex.left + ex.width, cand.left + cand.width) - Math.max(ex.left, cand.left));
+          const oy = Math.max(0, Math.min(ex.top + ex.height, cand.top + cand.height) - Math.max(ex.top, cand.top));
+          const minArea = Math.min(ex.width * ex.height, cand.width * cand.height);
+          return minArea > 0 && (ox * oy) / minArea > 0.35;
+        });
+        if (overlapIdx === -1) {
+          merged.push(cand);
+        } else if (cand.conf > merged[overlapIdx].conf + 8 && cand.str.length >= merged[overlapIdx].str.length) {
+          merged[overlapIdx] = cand;
+        }
+      }
+      return merged;
+    };
+
     // Pass 1: Crisp 2.0x upright document recognition
-    const res0 = await Tesseract.recognize(ocrCanvas, lang, {
+    const resRaw = await Tesseract.recognize(ocrCanvas, lang, {
       logger: (m) => {
         if (!silentModal && m && m.status && m.status.includes('recognizing')) {
           const pct = typeof m.progress === 'number' ? Math.round(m.progress * 100) : 0;
@@ -4501,10 +4676,18 @@ async function runOcrOnCurrentPage(lang = 'eng', forceRescan = false, silentModa
         }
       },
     });
-    const uprightWords = extractWords(res0, coordRatio, 28);
+    let uprightWords = extractWords(resRaw, coordRatio, 28);
+
+    // Pass 2: Local illumination-normalized + stroke-bridged enhancement for shaded headers, shadows & faded/broken ink
+    const enhCanvas = buildScannerContrastCanvas(ocrCanvas);
+    const resEnh = await Tesseract.recognize(enhCanvas, lang);
+    const enhWords = extractWords(resEnh, coordRatio, 30);
+    // Prefer enhanced-pass tokens cleanly alongside raw tokens
+    uprightWords = mergeWordPasses(enhWords, uprightWords);
+
     let finalLines = [];
 
-    // Pass 2: General +90 deg CW fallback ONLY when upright yields very few tokens (e.g. sideways landscape table/scan)
+    // Pass 3: General +90 deg CW fallback ONLY when upright yields very few tokens (e.g. sideways landscape table/sheet)
     if (uprightWords.length < 4) {
       const rot90Canvas = document.createElement('canvas');
       rot90Canvas.width = ocrCanvas.height;
@@ -4530,7 +4713,7 @@ async function runOcrOnCurrentPage(lang = 'eng', forceRescan = false, silentModa
           const boxTop = Math.max(0, Math.round(baseH - rx1));
           const boxWidth = Math.max(8, Math.round(ry1 - ry0));
           const boxHeight = Math.max(10, Math.round(rx1 - rx0));
-          const fontSize = Math.max(10, Math.min(44, Math.round(boxWidth * 0.90)));
+          const cal = calibrateTextboxToInkBounds(rLine.text, boxLeft, boxWidth, 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif', 'normal');
 
           finalLines.push({
             id: `ocr_rot_p${pageNum}_${idx}`,
@@ -4540,11 +4723,11 @@ async function runOcrOnCurrentPage(lang = 'eng', forceRescan = false, silentModa
             top: boxTop,
             width: boxWidth,
             height: boxHeight,
-            textLeft: boxLeft,
+            textLeft: cal.top,
             textTop: Math.round(baseH - rx0),
             angle: -90,
-            canvasFontSize: fontSize,
-            pdfFontSize: Math.round(fontSize / state.baseScale),
+            canvasFontSize: cal.fontSize,
+            pdfFontSize: Math.round(cal.fontSize / state.baseScale),
             isBold: false,
             fontFamily: 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
             isOcr: true,
@@ -4553,30 +4736,33 @@ async function runOcrOnCurrentPage(lang = 'eng', forceRescan = false, silentModa
       }
     }
 
-    // Refine upright OCR lines using pixel ink bounds
+    // Refine upright OCR lines using pixel ink bounds + exact Cap-Height baseline calibration
     if (finalLines.length === 0 && uprightWords.length > 0) {
+      const defaultFF = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
       const clusteredLines = clusterOcrWordsIntoLines(uprightWords);
       clusteredLines.forEach((line, idx) => {
         const colors = samplePdfColors(line.left, line.top, line.width, line.height);
         if (!colors.hasVisibleInk) return;
         const inkBounds = detectInkBoundsInBox(line.left, line.top, line.width, line.height, colors.bgColor);
-        const refinedTop = inkBounds ? inkBounds.inkTop : line.top;
-        const refinedHeight = inkBounds ? Math.max(8, inkBounds.inkHeight) : line.height;
-        const refinedFontSize = Math.max(9, Math.min(48, Math.round(refinedHeight * 1.0)));
+        const tightTop = inkBounds ? inkBounds.inkTop : line.top;
+        const tightHeight = inkBounds ? Math.max(8, inkBounds.inkHeight) : line.height;
+        const isBoldLine = inkBounds ? inkBounds.isBold : Boolean(colors.isBoldInk);
+        const cal = calibrateTextboxToInkBounds(line.text, tightTop, tightHeight, defaultFF, isBoldLine ? 'bold' : 'normal');
 
         finalLines.push({
           id: `ocr_p${pageNum}_${idx}`,
           text: line.text,
           str: line.text,
           left: inkBounds ? inkBounds.inkLeft : line.left,
-          top: refinedTop,
+          top: tightTop,
+          textTop: cal.top,
           width: inkBounds ? Math.max(line.width, inkBounds.inkWidth) : line.width,
-          height: refinedHeight,
+          height: tightHeight,
           angle: 0,
-          canvasFontSize: refinedFontSize,
-          pdfFontSize: Math.round(refinedFontSize / state.baseScale),
-          isBold: inkBounds ? inkBounds.isBold : Boolean(colors.isBoldInk),
-          fontFamily: 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
+          canvasFontSize: cal.fontSize,
+          pdfFontSize: Math.round(cal.fontSize / state.baseScale),
+          isBold: isBoldLine,
+          fontFamily: defaultFF,
           isOcr: true,
         });
       });
