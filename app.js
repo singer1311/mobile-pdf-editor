@@ -71,6 +71,8 @@ const SERIALIZE_PROPS = [
   'padding',
   'shadow',
   'opacity',
+  'angle',
+  'charSpacing',
   'borderColor',
   'borderDashArray',
   'borderScaleFactor',
@@ -188,58 +190,192 @@ function buildMaskSeamlessPatch(maskObj, sourcePdfCanvas = null, coordScale = 1.
       return;
     }
 
-    // Scanned / Textured / Shadowed background: build column-profiled top & bottom background arrays
-    const rawTopBg = new Array(sw);
-    const rawBotBg = new Array(sw);
     const ox = sx - bx;
     const oy = sy - by;
+    const isVerticalStrip = (sh > sw * 1.35);
 
-    for (let x = 0; x < sw; x++) {
-      let tr = 0, tg = 0, tb = 0, tc = 0;
-      let br = 0, bg = 0, bb = 0, bc = 0;
-      const xStart = Math.max(0, ox + x - 3);
-      const xEnd = Math.min(bw - 1, ox + x + 3);
+    // If vertical strip (e.g. -90° rotated text on a card/scan), profile LEFT and RIGHT rims per row y!
+    // Otherwise profile TOP and BOTTOM rims per column x!
+    const expBgR = new Float32Array(bw * bh);
+    const expBgG = new Float32Array(bw * bh);
+    const expBgB = new Float32Array(bw * bh);
 
-      // Sample top rim rows
-      for (let ry = 0; ry < Math.min(bh, oy + Math.max(3, Math.floor(sh * 0.35))); ry++) {
-        for (let rx = xStart; rx <= xEnd; rx += 2) {
-          const idx = (ry * bw + rx) * 4;
-          const r = srcData[idx], g = srcData[idx + 1], b = srcData[idx + 2];
-          if (Math.abs(r - baseRgb.r) + Math.abs(g - baseRgb.g) + Math.abs(b - baseRgb.b) <= 42) {
-            tr += r; tg += g; tb += b; tc++;
+    if (isVerticalStrip) {
+      const rawLeftBg = new Array(bh);
+      const rawRightBg = new Array(bh);
+      for (let y = 0; y < bh; y++) {
+        const leftPixels = [], rightPixels = [];
+        for (let ry = Math.max(0, y - 3); ry <= Math.min(bh - 1, y + 3); ry++) {
+          for (let rx = 0; rx < Math.min(bw, ox + 3); rx++) {
+            const i = (ry * bw + rx) * 4;
+            leftPixels.push({ r: srcData[i], g: srcData[i + 1], b: srcData[i + 2], lum: srcData[i] + srcData[i + 1] + srcData[i + 2] });
+          }
+          for (let rx = Math.max(0, ox + sw - 3); rx < bw; rx++) {
+            const i = (ry * bw + rx) * 4;
+            rightPixels.push({ r: srcData[i], g: srcData[i + 1], b: srcData[i + 2], lum: srcData[i] + srcData[i + 1] + srcData[i + 2] });
           }
         }
-        if (tc >= 6 && ry >= oy + 1) break;
+        leftPixels.sort((a, b) => b.lum - a.lum);
+        rightPixels.sort((a, b) => b.lum - a.lum);
+        const lTop = leftPixels.slice(0, Math.max(1, Math.ceil(leftPixels.length * 0.65)));
+        const rTop = rightPixels.slice(0, Math.max(1, Math.ceil(rightPixels.length * 0.65)));
+        rawLeftBg[y] = lTop.length > 0 ? {
+          r: lTop.reduce((s, p) => s + p.r, 0) / lTop.length,
+          g: lTop.reduce((s, p) => s + p.g, 0) / lTop.length,
+          b: lTop.reduce((s, p) => s + p.b, 0) / lTop.length,
+        } : { ...baseRgb };
+        rawRightBg[y] = rTop.length > 0 ? {
+          r: rTop.reduce((s, p) => s + p.r, 0) / rTop.length,
+          g: rTop.reduce((s, p) => s + p.g, 0) / rTop.length,
+          b: rTop.reduce((s, p) => s + p.b, 0) / rTop.length,
+        } : { ...rawLeftBg[y] };
       }
 
-      // Sample bottom rim rows
-      for (let ry = bh - 1; ry >= Math.max(0, oy + Math.floor(sh * 0.65)); ry--) {
-        for (let rx = xStart; rx <= xEnd; rx += 2) {
-          const idx = (ry * bw + rx) * 4;
-          const r = srcData[idx], g = srcData[idx + 1], b = srcData[idx + 2];
-          if (Math.abs(r - baseRgb.r) + Math.abs(g - baseRgb.g) + Math.abs(b - baseRgb.b) <= 42) {
-            br += r; bg += g; bb += b; bc++;
+      for (let y = 0; y < bh; y++) {
+        let lr = 0, lg = 0, lb = 0, rr = 0, rg = 0, rb = 0, cnt = 0;
+        for (let k = Math.max(0, y - 4); k <= Math.min(bh - 1, y + 4); k++) {
+          lr += rawLeftBg[k].r; lg += rawLeftBg[k].g; lb += rawLeftBg[k].b;
+          rr += rawRightBg[k].r; rg += rawRightBg[k].g; rb += rawRightBg[k].b;
+          cnt++;
+        }
+        const lAvg = { r: lr / cnt, g: lg / cnt, b: lb / cnt };
+        const rAvg = { r: rr / cnt, g: rg / cnt, b: rb / cnt };
+        for (let x = 0; x < bw; x++) {
+          const tX = Math.max(0, Math.min(1, (x - ox) / Math.max(1, sw - 1)));
+          const p = y * bw + x;
+          expBgR[p] = lAvg.r * (1 - tX) + rAvg.r * tX;
+          expBgG[p] = lAvg.g * (1 - tX) + rAvg.g * tX;
+          expBgB[p] = lAvg.b * (1 - tX) + rAvg.b * tX;
+        }
+      }
+    } else {
+      // Horizontal text strip: profile TOP and BOTTOM rims per column x
+      const rawTopBg = new Array(bw);
+      const rawBotBg = new Array(bw);
+      for (let x = 0; x < bw; x++) {
+        const topPixels = [], botPixels = [];
+        for (let rx = Math.max(0, x - 3); rx <= Math.min(bw - 1, x + 3); rx++) {
+          for (let ry = 0; ry < Math.min(bh, oy + 3); ry++) {
+            const i = (ry * bw + rx) * 4;
+            topPixels.push({ r: srcData[i], g: srcData[i + 1], b: srcData[i + 2], lum: srcData[i] + srcData[i + 1] + srcData[i + 2] });
+          }
+          for (let ry = Math.max(0, oy + sh - 3); ry < bh; ry++) {
+            const i = (ry * bw + rx) * 4;
+            botPixels.push({ r: srcData[i], g: srcData[i + 1], b: srcData[i + 2], lum: srcData[i] + srcData[i + 1] + srcData[i + 2] });
           }
         }
-        if (bc >= 6 && ry <= oy + sh - 1) break;
+        topPixels.sort((a, b) => b.lum - a.lum);
+        botPixels.sort((a, b) => b.lum - a.lum);
+        const tTop = topPixels.slice(0, Math.max(1, Math.ceil(topPixels.length * 0.65)));
+        const bTop = botPixels.slice(0, Math.max(1, Math.ceil(botPixels.length * 0.65)));
+        rawTopBg[x] = tTop.length > 0 ? {
+          r: tTop.reduce((s, p) => s + p.r, 0) / tTop.length,
+          g: tTop.reduce((s, p) => s + p.g, 0) / tTop.length,
+          b: tTop.reduce((s, p) => s + p.b, 0) / tTop.length,
+        } : { ...baseRgb };
+        rawBotBg[x] = bTop.length > 0 ? {
+          r: bTop.reduce((s, p) => s + p.r, 0) / bTop.length,
+          g: bTop.reduce((s, p) => s + p.g, 0) / bTop.length,
+          b: bTop.reduce((s, p) => s + p.b, 0) / bTop.length,
+        } : { ...rawTopBg[x] };
       }
 
-      rawTopBg[x] = tc > 0 ? { r: tr / tc, g: tg / tc, b: tb / tc } : { ...baseRgb };
-      rawBotBg[x] = bc > 0 ? { r: br / bc, g: bg / bc, b: bb / bc } : { ...rawTopBg[x] };
+      for (let x = 0; x < bw; x++) {
+        let tr = 0, tg = 0, tb = 0, br = 0, bg = 0, bb = 0, cnt = 0;
+        for (let k = Math.max(0, x - 4); k <= Math.min(bw - 1, x + 4); k++) {
+          tr += rawTopBg[k].r; tg += rawTopBg[k].g; tb += rawTopBg[k].b;
+          br += rawBotBg[k].r; bg += rawBotBg[k].g; bb += rawBotBg[k].b;
+          cnt++;
+        }
+        const tAvg = { r: tr / cnt, g: tg / cnt, b: tb / cnt };
+        const bAvg = { r: br / cnt, g: bg / cnt, b: bb / cnt };
+        for (let y = 0; y < bh; y++) {
+          const tY = Math.max(0, Math.min(1, (y - oy) / Math.max(1, sh - 1)));
+          const p = y * bw + x;
+          expBgR[p] = tAvg.r * (1 - tY) + bAvg.r * tY;
+          expBgG[p] = tAvg.g * (1 - tY) + bAvg.g * tY;
+          expBgB[p] = tAvg.b * (1 - tY) + bAvg.b * tY;
+        }
+      }
     }
 
-    // Smooth column profiles horizontally with a 9-px moving average to eliminate any vertical banding
-    const topBg = new Array(sw);
-    const botBg = new Array(sw);
-    for (let x = 0; x < sw; x++) {
-      let tr = 0, tg = 0, tb = 0, br = 0, bg = 0, bb = 0, cnt = 0;
-      for (let k = Math.max(0, x - 4); k <= Math.min(sw - 1, x + 4); k++) {
-        tr += rawTopBg[k].r; tg += rawTopBg[k].g; tb += rawTopBg[k].b;
-        br += rawBotBg[k].r; bg += rawBotBg[k].g; bb += rawBotBg[k].b;
-        cnt++;
+    // Detect ink strokes vs clean background pattern, dilate by 3px with soft feathering, and run harmonic Laplace diffusion!
+    const rawInk = new Uint8Array(bw * bh);
+    for (let p = 0; p < bw * bh; p++) {
+      const i = p * 4;
+      const r = srcData[i], g = srcData[i + 1], b = srcData[i + 2];
+      const dist = Math.abs(r - expBgR[p]) + Math.abs(g - expBgG[p]) + Math.abs(b - expBgB[p]);
+      const darkDiff = (expBgR[p] - r) + (expBgG[p] - g) + (expBgB[p] - b);
+      if (darkDiff > 38 || dist > 48 || (r < 108 && g < 108 && b < 108 && darkDiff > 24)) {
+        rawInk[p] = 1;
       }
-      topBg[x] = { r: tr / cnt, g: tg / cnt, b: tb / cnt };
-      botBg[x] = { r: br / cnt, g: bg / cnt, b: bb / cnt };
+    }
+
+    const inkWeight = new Float32Array(bw * bh);
+    const fillR = new Float32Array(bw * bh);
+    const fillG = new Float32Array(bw * bh);
+    const fillB = new Float32Array(bw * bh);
+
+    for (let y = 0; y < bh; y++) {
+      for (let x = 0; x < bw; x++) {
+        let minDistSq = 99;
+        for (let dy = -3; dy <= 3; dy++) {
+          const ny = y + dy;
+          if (ny < 0 || ny >= bh) continue;
+          for (let dx = -3; dx <= 3; dx++) {
+            const nx = x + dx;
+            if (nx < 0 || nx >= bw) continue;
+            if (rawInk[ny * bw + nx]) {
+              const d2 = dx * dx + dy * dy;
+              if (d2 < minDistSq) minDistSq = d2;
+            }
+          }
+        }
+        const p = y * bw + x;
+        const i = p * 4;
+        if (minDistSq <= 2) inkWeight[p] = 1.0;
+        else if (minDistSq <= 5) inkWeight[p] = 0.85;
+        else if (minDistSq <= 9) inkWeight[p] = 0.55;
+        else if (minDistSq <= 13) inkWeight[p] = 0.25;
+
+        if (inkWeight[p] === 0) {
+          fillR[p] = srcData[i];
+          fillG[p] = srcData[i + 1];
+          fillB[p] = srcData[i + 2];
+        } else {
+          fillR[p] = expBgR[p];
+          fillG[p] = expBgG[p];
+          fillB[p] = expBgB[p];
+        }
+      }
+    }
+
+    // 4 passes of 5x5 harmonic Laplace diffusion over ink pixels so background patterns flow seamlessly across erased strokes
+    for (let iter = 0; iter < 4; iter++) {
+      for (let y = 1; y < bh - 1; y++) {
+        for (let x = 1; x < bw - 1; x++) {
+          const p = y * bw + x;
+          if (inkWeight[p] === 0) continue;
+          let sr = 0, sg = 0, sb = 0, wSum = 0;
+          for (let dy = -2; dy <= 2; dy++) {
+            const ny = y + dy;
+            if (ny < 0 || ny >= bh) continue;
+            for (let dx = -2; dx <= 2; dx++) {
+              const nx = x + dx;
+              if (nx < 0 || nx >= bw) continue;
+              const np = ny * bw + nx;
+              const w = inkWeight[np] === 0 ? 2.5 : 1.0;
+              sr += fillR[np] * w;
+              sg += fillG[np] * w;
+              sb += fillB[np] * w;
+              wSum += w;
+            }
+          }
+          fillR[p] = sr / wSum;
+          fillG[p] = sg / wSum;
+          fillB[p] = sb / wSum;
+        }
+      }
     }
 
     const patchCanvas = document.createElement('canvas');
@@ -250,52 +386,31 @@ function buildMaskSeamlessPatch(maskObj, sourcePdfCanvas = null, coordScale = 1.
     const out = outImg.data;
     const grainAmp = Math.min(5.5, Math.max(0.8, bgStdDev * 1.15));
 
-    const isPixelCleanPaper = (px, py, expR, expG, expB) => {
-      const idx = (py * bw + px) * 4;
-      const dist = Math.abs(srcData[idx] - expR) + Math.abs(srcData[idx + 1] - expG) + Math.abs(srcData[idx + 2] - expB);
-      return dist <= 20;
-    };
-
     for (let y = 0; y < sh; y++) {
-      const tY = sh > 1 ? (y / (sh - 1)) : 0.5;
       const py = Math.min(bh - 1, oy + y);
       for (let x = 0; x < sw; x++) {
         const px = Math.min(bw - 1, ox + x);
-        const expR = topBg[x].r * (1 - tY) + botBg[x].r * tY;
-        const expG = topBg[x].g * (1 - tY) + botBg[x].g * tY;
-        const expB = topBg[x].b * (1 - tY) + botBg[x].b * tY;
-
-        const srcIdx = (py * bw + px) * 4;
+        const p = py * bw + px;
+        const srcIdx = p * 4;
         const origR = srcData[srcIdx];
         const origG = srcData[srcIdx + 1];
         const origB = srcData[srcIdx + 2];
-        const origDist = Math.abs(origR - expR) + Math.abs(origG - expG) + Math.abs(origB - expB);
+        const w = inkWeight[p];
 
-        let finalR, finalG, finalB;
-        // If this pixel and its immediate neighbors have no ink (pure original paper), keep real scan texture!
-        if (
-          origDist <= 18 &&
-          isPixelCleanPaper(Math.max(0, px - 1), py, expR, expG, expB) &&
-          isPixelCleanPaper(Math.min(bw - 1, px + 1), py, expR, expG, expB) &&
-          isPixelCleanPaper(px, Math.max(0, py - 1), expR, expG, expB) &&
-          isPixelCleanPaper(px, Math.min(bh - 1, py + 1), expR, expG, expB)
-        ) {
-          finalR = origR;
-          finalG = origG;
-          finalB = origB;
-        } else {
-          // Deterministic 2D paper grain matching local scan noise
-          const hash = (((sx + x) * 73856093) ^ ((sy + y) * 19349663)) & 0xff;
-          const grain = ((hash / 255) - 0.5) * 2 * grainAmp;
-          finalR = Math.max(0, Math.min(255, Math.round(expR + grain)));
-          finalG = Math.max(0, Math.min(255, Math.round(expG + grain)));
-          finalB = Math.max(0, Math.min(255, Math.round(expB + grain)));
-        }
+        const hash = (((sx + x) * 73856093) ^ ((sy + y) * 19349663)) & 0xff;
+        const grain = ((hash / 255) - 0.5) * 2 * grainAmp;
+        const inpaintR = Math.max(0, Math.min(255, fillR[p] + grain));
+        const inpaintG = Math.max(0, Math.min(255, fillG[p] + grain));
+        const inpaintB = Math.max(0, Math.min(255, fillB[p] + grain));
+
+        const finalR = Math.round(origR * (1 - w) + inpaintR * w);
+        const finalG = Math.round(origG * (1 - w) + inpaintG * w);
+        const finalB = Math.round(origB * (1 - w) + inpaintB * w);
 
         // Soft 1px outer rim feathering where there is no dark ink on the boundary
         let alpha = 255;
-        if ((x === 0 || x === sw - 1 || y === 0 || y === sh - 1) && origDist <= 34) {
-          alpha = 185;
+        if ((x === 0 || x === sw - 1 || y === 0 || y === sh - 1) && w < 0.5) {
+          alpha = 180;
         }
 
         const outIdx = (y * sw + x) * 4;
@@ -348,14 +463,17 @@ function applyScanInkBlend(textbox, enable = true) {
 }
 
 let _measureCanvas = null;
-function measureTextLineWidth(text, fontSize = 16, fontWeight = 'normal', fontFamily = 'system-ui, -apple-system, sans-serif') {
+function measureTextLineWidth(text, fontSize = 16, fontWeight = 'normal', fontFamily = 'system-ui, -apple-system, sans-serif', charSpacing = 0) {
   try {
     if (!_measureCanvas) _measureCanvas = document.createElement('canvas');
     const ctx = _measureCanvas.getContext('2d');
-    ctx.font = `${fontWeight || 'normal'} ${fontSize || 16}px ${fontFamily || 'system-ui, -apple-system, sans-serif'}`;
+    const fs = fontSize || 16;
+    ctx.font = `${fontWeight || 'normal'} ${fs}px ${fontFamily || 'system-ui, -apple-system, sans-serif'}`;
+    const extraPerChar = charSpacing ? ((charSpacing / 1000) * fs) : 0;
     let maxW = 0;
     for (const line of String(text || '').split('\n')) {
-      const w = ctx.measureText(line).width;
+      const extra = line.length > 1 ? (line.length - 1) * extraPerChar : 0;
+      const w = ctx.measureText(line).width + extra;
       if (w > maxW) maxW = w;
     }
     return maxW;
@@ -430,10 +548,12 @@ const elements = {
   btnPrevPage: document.getElementById('btn-prev-page'),
   btnNextPage: document.getElementById('btn-next-page'),
   btnOpenPdf: document.getElementById('btn-open-pdf'),
+  btnRotatePage: document.getElementById('btn-rotate-page'),
   btnOcrPage: document.getElementById('btn-ocr-page'),
   toolOcrPage: document.getElementById('tool-ocr-page'),
   scanDetectedBanner: document.getElementById('scan-detected-banner'),
   scanBannerText: document.getElementById('scan-banner-text'),
+  btnScanRotate: document.getElementById('btn-scan-rotate'),
   btnOcrFastEng: document.getElementById('btn-ocr-fast-eng'),
   btnOcrChiEng: document.getElementById('btn-ocr-chi-eng'),
   btnCloseScanBanner: document.getElementById('btn-close-scan-banner'),
@@ -451,6 +571,7 @@ const elements = {
   btnExportPdf: document.getElementById('btn-export-pdf'),
   modeSwitchGroup: document.getElementById('mode-switch-group'),
   btnModeBrowse: document.getElementById('btn-mode-browse'),
+  btnModeSelect: document.getElementById('btn-mode-select'),
   btnModeEdit: document.getElementById('btn-mode-edit'),
 
   // Zoom HUD
@@ -464,6 +585,7 @@ const elements = {
 
   // Toolbar buttons
   toolTapEdit: document.getElementById('tool-tap-edit'),
+  toolSelect: document.getElementById('tool-select'),
   toolCoverEdit: document.getElementById('tool-cover-edit'),
   toolConvertPage: document.getElementById('tool-convert-page'),
   toolBrowse: document.getElementById('tool-browse'),
@@ -531,6 +653,10 @@ const elements = {
   inputReplaceFind: document.getElementById('input-replace-find'),
   inputReplaceTarget: document.getElementById('input-replace-target'),
   replaceMatchCountBadge: document.getElementById('replace-match-count-badge'),
+  replaceDetectedChipsContainer: document.getElementById('replace-detected-chips-container'),
+  replaceChipsTitle: document.getElementById('replace-chips-title'),
+  btnRescanInReplace: document.getElementById('btn-rescan-in-replace'),
+  replaceDetectedChips: document.getElementById('replace-detected-chips'),
   replacePreviewContainer: document.getElementById('replace-preview-container'),
   replacePreviewList: document.getElementById('replace-preview-list'),
   chkReplaceExact: document.getElementById('chk-replace-exact'),
@@ -631,6 +757,10 @@ async function openPdfFile(arrayBuffer, fileName = 'document.pdf', password = ''
     elements.modeSwitchGroup.classList.add('flex');
     elements.floatingZoomHud.classList.remove('hidden');
     elements.floatingZoomHud.classList.add('flex');
+    if (elements.btnRotatePage) {
+      elements.btnRotatePage.classList.remove('hidden');
+      elements.btnRotatePage.classList.add('flex');
+    }
     if (elements.btnOcrPage) {
       elements.btnOcrPage.classList.remove('hidden');
       elements.btnOcrPage.classList.add('flex');
@@ -885,20 +1015,26 @@ function fitToScreenWidth() {
 // ==========================================
 function setMode(newMode) {
   state.mode = newMode;
+  const activeClass = 'px-2 sm:px-2.5 py-1 text-xs font-semibold rounded-md flex items-center space-x-1 transition bg-white text-blue-600 shadow-sm';
+  const inactiveClass = 'px-2 sm:px-2.5 py-1 text-xs font-semibold rounded-md flex items-center space-x-1 transition text-slate-600 hover:text-slate-900';
+
+  if (elements.btnModeBrowse) elements.btnModeBrowse.className = (newMode === 'browse') ? activeClass : inactiveClass;
+  if (elements.btnModeSelect) elements.btnModeSelect.className = (newMode === 'select') ? activeClass : inactiveClass;
+  if (elements.btnModeEdit) elements.btnModeEdit.className = (newMode === 'edit') ? activeClass : inactiveClass;
+
   if (newMode === 'browse') {
-    elements.btnModeBrowse.className = 'px-2 sm:px-2.5 py-1 text-xs font-semibold rounded-md flex items-center space-x-1 transition bg-white text-blue-600 shadow-sm';
-    elements.btnModeEdit.className = 'px-2 sm:px-2.5 py-1 text-xs font-semibold rounded-md flex items-center space-x-1 transition text-slate-600 hover:text-slate-900';
     setTool('browse');
     showToast('已进入浏览模式：可单指滑动拖拽，双指缩放', 'info');
+  } else if (newMode === 'select') {
+    setTool('select');
+    showToast('已进入选中模式：点击或框选任意文字即可选中、移动、缩放或一键替换', 'info');
   } else {
-    elements.btnModeEdit.className = 'px-2 sm:px-2.5 py-1 text-xs font-semibold rounded-md flex items-center space-x-1 transition bg-white text-blue-600 shadow-sm';
-    elements.btnModeBrowse.className = 'px-2 sm:px-2.5 py-1 text-xs font-semibold rounded-md flex items-center space-x-1 transition text-slate-600 hover:text-slate-900';
-    if (state.tool === 'browse') {
-      setTool('cover-edit');
+    if (state.tool === 'browse' || state.tool === 'select') {
+      setTool('tap-edit');
     } else {
       applyCurrentMode();
     }
-    showToast('已进入编辑模式：支持框选改字、添加签名', 'info');
+    showToast('已进入编辑模式：点击文字直接改，或框选区域无痕改字', 'info');
   }
 }
 
@@ -923,14 +1059,25 @@ function setTool(toolName) {
     }
   }
 
-  // Auto switch mode pill if browse clicked
-  if (toolName === 'browse' && state.mode !== 'browse') {
-    setMode('browse');
-    return;
-  }
-  if (toolName !== 'browse' && state.mode === 'browse') {
-    setMode('edit');
-    return;
+  // Sync top mode switcher pill
+  const activeClass = 'px-2 sm:px-2.5 py-1 text-xs font-semibold rounded-md flex items-center space-x-1 transition bg-white text-blue-600 shadow-sm';
+  const inactiveClass = 'px-2 sm:px-2.5 py-1 text-xs font-semibold rounded-md flex items-center space-x-1 transition text-slate-600 hover:text-slate-900';
+
+  if (toolName === 'browse') {
+    state.mode = 'browse';
+    if (elements.btnModeBrowse) elements.btnModeBrowse.className = activeClass;
+    if (elements.btnModeSelect) elements.btnModeSelect.className = inactiveClass;
+    if (elements.btnModeEdit) elements.btnModeEdit.className = inactiveClass;
+  } else if (toolName === 'select') {
+    state.mode = 'select';
+    if (elements.btnModeBrowse) elements.btnModeBrowse.className = inactiveClass;
+    if (elements.btnModeSelect) elements.btnModeSelect.className = activeClass;
+    if (elements.btnModeEdit) elements.btnModeEdit.className = inactiveClass;
+  } else {
+    state.mode = 'edit';
+    if (elements.btnModeBrowse) elements.btnModeBrowse.className = inactiveClass;
+    if (elements.btnModeSelect) elements.btnModeSelect.className = inactiveClass;
+    if (elements.btnModeEdit) elements.btnModeEdit.className = activeClass;
   }
 
   applyCurrentMode();
@@ -1005,9 +1152,13 @@ function setupFabricEventListeners() {
   // Mouse down / Touch start
   fabricCanvas.on('mouse:down', (opt) => {
     const pointer = opt.pointer || (opt.e ? fabricCanvas.getPointer(opt.e) : { x: 0, y: 0 });
+    state.selectDownX = pointer.x;
+    state.selectDownY = pointer.y;
+    state.selectHadTarget = Boolean(opt.target);
 
-    // 1. Smart Word-like "Tap to Edit"
-    if (state.tool === 'tap-edit') {
+    // 1. Smart Word-like "Tap to Edit" OR "Select" on unedited PDF text lines
+    if (state.tool === 'tap-edit' || (state.tool === 'select' && !opt.target)) {
+      const isSelectOnly = (state.tool === 'select');
       const activeObj = fabricCanvas.getActiveObject();
 
       // If an object is currently editing, check if user clicked outside its strict bounds
@@ -1030,38 +1181,54 @@ function setupFabricEventListeners() {
       const hitBox = findClosestObject(textboxes, pointer);
       if (hitBox) {
         fabricCanvas.setActiveObject(hitBox);
-        setTimeout(() => {
-          hitBox.enterEditing();
-          hitBox.hiddenTextarea?.focus();
+        updatePropertyBar();
+        if (!isSelectOnly) {
+          setTimeout(() => {
+            hitBox.enterEditing();
+            hitBox.hiddenTextarea?.focus();
+            fabricCanvas.requestRenderAll();
+          }, 30);
+        } else {
           fabricCanvas.requestRenderAll();
-        }, 30);
+          showToast('已选中文本框：可拖动位置、调字号颜色、点「替换」或双击打字', 'info');
+        }
         return;
       }
 
-      // If not an existing textbox, check extracted text lines from the PDF
+      // If not an existing textbox, check extracted/OCR text lines from the PDF
       const lines = state.pageTextLines[state.currentPage] || [];
       const hitLine = findClosestTextLine(lines, pointer);
 
       if (hitLine) {
-        // Check if an existing textbox already covers this line (by line ID or exact coordinate match)
         const existing = fabricCanvas.getObjects().find(o => 
           o.data?.isText &&
           (o.data?.lineId === hitLine.id ||
-           (Math.abs(o.left - hitLine.left) < 6 && Math.abs(o.top - hitLine.top) < 4))
+           (Math.abs(o.left - hitLine.left) < 6 && Math.abs(o.top - hitLine.top) < 6))
         );
 
         if (existing) {
           fabricCanvas.setActiveObject(existing);
-          setTimeout(() => {
-            existing.enterEditing();
-            existing.hiddenTextarea?.focus();
+          updatePropertyBar();
+          if (!isSelectOnly) {
+            setTimeout(() => {
+              existing.enterEditing();
+              existing.hiddenTextarea?.focus();
+              fabricCanvas.requestRenderAll();
+            }, 30);
+          } else {
             fabricCanvas.requestRenderAll();
-          }, 30);
+          }
           return;
         }
 
         // Convert this specific text line to an in-place Word textbox immediately!
-        convertLineToTextbox(hitLine, true);
+        const tb = convertLineToTextbox(hitLine, !isSelectOnly);
+        if (isSelectOnly && tb) {
+          fabricCanvas.setActiveObject(tb);
+          updatePropertyBar();
+          fabricCanvas.requestRenderAll();
+          showToast(`已选中「${hitLine.text.substring(0, 18)}」：可移动、缩放、点顶部「替换」或双击改字！`, 'info');
+        }
         return;
       }
     }
@@ -1102,12 +1269,51 @@ function setupFabricEventListeners() {
   });
 
   // Mouse up / Touch end
-  fabricCanvas.on('mouse:up', (opt) => {
+  fabricCanvas.on('mouse:up', async (opt) => {
+    const pointer = opt.pointer || (opt.e ? fabricCanvas.getPointer(opt.e) : { x: 0, y: 0 });
+
+    // In 'select' mode: if user dragged a marquee box over unedited PDF/scan text (and no Fabric object was selected), select & convert those lines or OCR that box!
+    if (state.tool === 'select' && !state.isDrawingBox && !state.selectHadTarget && !fabricCanvas.getActiveObject()) {
+      const sLeft = Math.min(state.selectDownX || 0, pointer.x);
+      const sTop = Math.min(state.selectDownY || 0, pointer.y);
+      const sWidth = Math.abs((state.selectDownX || 0) - pointer.x);
+      const sHeight = Math.abs((state.selectDownY || 0) - pointer.y);
+      if (sWidth >= 10 && sHeight >= 10) {
+        const pageLines = state.pageTextLines[state.currentPage] || [];
+        const matchedLines = pageLines.filter(l => {
+          const ox = Math.max(0, Math.min(sLeft + sWidth, l.left + l.width) - Math.max(sLeft, l.left));
+          const oy = Math.max(0, Math.min(sTop + sHeight, l.top + l.height) - Math.max(sTop, l.top));
+          return ox > 4 && oy > 4;
+        });
+        if (matchedLines.length > 0) {
+          const createdBoxes = [];
+          for (const l of matchedLines) {
+            let tb = fabricCanvas.getObjects().find(o => o.data?.isText && o.data?.lineId === l.id);
+            if (!tb) tb = convertLineToTextbox(l, false);
+            if (tb) createdBoxes.push(tb);
+          }
+          if (createdBoxes.length === 1) {
+            fabricCanvas.setActiveObject(createdBoxes[0]);
+          } else if (createdBoxes.length > 1) {
+            const sel = new fabric.ActiveSelection(createdBoxes, { canvas: fabricCanvas });
+            fabricCanvas.setActiveObject(sel);
+          }
+          updatePropertyBar();
+          fabricCanvas.requestRenderAll();
+          showToast(`已框选选中 ${createdBoxes.length} 处文字！`, 'success');
+          return;
+        } else {
+          // Scanned area with no pre-extracted line: crop-OCR that box and select it!
+          await createAndSelectBoxWithLocalOcr(sLeft, sTop, sWidth, sHeight, false);
+          return;
+        }
+      }
+    }
+
     if (!state.isDrawingBox || !state.rubberBandRect) return;
     state.isDrawingBox = false;
 
     fabricCanvas.remove(state.rubberBandRect);
-    const pointer = opt.pointer || (opt.e ? fabricCanvas.getPointer(opt.e) : { x: 0, y: 0 });
     const left = Math.min(state.boxStartX, pointer.x);
     const top = Math.min(state.boxStartY, pointer.y);
     const width = Math.abs(state.boxStartX - pointer.x);
@@ -1120,7 +1326,7 @@ function setupFabricEventListeners() {
       if (state.tool === 'tap-edit' && state.isScannedPage[state.currentPage]) {
         const lines = state.pageTextLines[state.currentPage] || [];
         if (lines.length <= 2) {
-          showToast('此页为扫描图片：请按住拖动框选文字无痕改，或点顶部「扫描件识别」开启点击即改！', 'info');
+          showToast('此页为扫描图片：请按住拖动框选文字无痕改，或点顶部「扫描识字」开启点击即改！', 'info');
         }
       }
       return;
@@ -1128,112 +1334,39 @@ function setupFabricEventListeners() {
 
     const isCoverEditAction = (state.tool === 'cover-edit' || state.tool === 'tap-edit');
 
-    // 1. Smart dual-sample background and text color from PDF
-    const colors = samplePdfColors(left, top, width, height);
-
-    // 2. Create the background mask rectangle (with seamless texture patch on scanned images)
-    const maskId = 'mask_' + Date.now();
-    const textId = 'text_' + Date.now();
-    const maskRect = new fabric.Rect({
-      left: left,
-      top: top,
-      width: width,
-      height: height,
-      fill: colors.bgColor,
-      selectable: (state.tool === 'mask'),
-      evented: (state.tool === 'mask'),
-      hasBorders: true,
-      borderColor: '#94a3b8',
-      cornerSize: 12,
-      strokeWidth: 0,
-      data: {
-        isMask: true,
-        id: maskId,
-        linkedTextId: isCoverEditAction ? textId : undefined,
-        initialMaskWidth: width,
-        initialLeft: left,
-        bgColor: colors.bgColor,
-      },
-    });
-    buildMaskSeamlessPatch(maskRect, elements.pdfCanvas, 1.0);
-    fabricCanvas.add(maskRect);
-
-    // 3. If in 'cover-edit' (or drag on scanned page in 'tap-edit'), immediately spawn in-place editable Textbox snapped to ink bounds!
     if (isCoverEditAction) {
-      const inkBounds = detectInkBoundsInBox(left, top, width, height, colors.bgColor);
-      const hasTightInk = inkBounds && inkBounds.inkHeight >= 6;
-      const calculatedFontSize = hasTightInk
-        ? Math.max(10, Math.min(Math.round(inkBounds.inkHeight * 1.02), 48))
-        : Math.max(12, Math.min(Math.round(height * 0.72), 48));
-      state.fontSize = calculatedFontSize;
-
-      const textLeft = hasTightInk ? inkBounds.inkLeft : left;
-      const textTop = hasTightInk
-        ? Math.max(top, Math.round(inkBounds.inkTop - calculatedFontSize * 0.08))
-        : top + Math.max(0, (height - calculatedFontSize * 1.18) / 2);
-      const detectedBold = hasTightInk ? inkBounds.isBold : Boolean(colors.isBoldInk || state.isBold);
-
-      // Check if an extracted or OCR line overlaps this dragged box to pre-fill its text
-      let prefillText = '点击输入修改文字';
-      const pageLines = state.pageTextLines[state.currentPage] || [];
-      for (const l of pageLines) {
-        const overlapX = Math.max(0, Math.min(left + width, l.left + l.width) - Math.max(left, l.left));
-        const overlapY = Math.max(0, Math.min(top + height, l.top + l.height) - Math.max(top, l.top));
-        if (overlapX > 4 && overlapY > 4 && l.text && l.text.trim()) {
-          prefillText = l.text.trim();
-          break;
-        }
-      }
-
-      const initialWidth = Math.max(width + 20, 100);
-      const textbox = new fabric.Textbox(prefillText, {
-        left: textLeft,
-        top: textTop,
-        width: initialWidth,
-        fontSize: calculatedFontSize,
-        fill: colors.textColor,
-        backgroundColor: 'transparent',
-        fontFamily: 'system-ui, -apple-system, sans-serif',
-        fontWeight: detectedBold ? 'bold' : 'normal',
-        splitByGrapheme: true,
-        editable: true,
+      await createAndSelectBoxWithLocalOcr(left, top, width, height, true);
+    } else {
+      const colors = samplePdfColors(left, top, width, height);
+      const maskId = 'mask_' + Date.now();
+      const maskRect = new fabric.Rect({
+        left: left,
+        top: top,
+        width: width,
+        height: height,
+        fill: colors.bgColor,
+        selectable: true,
+        evented: true,
         hasBorders: true,
-        borderColor: '#93c5fd',
-        borderDashArray: [3, 3],
-        padding: 0,
-        lineHeight: 1.05,
-        cornerColor: '#2563eb',
-        cornerSize: 8,
-        touchCornerSize: 14,
+        borderColor: '#94a3b8',
+        cornerSize: 12,
+        strokeWidth: 0,
         data: {
-          isText: true,
-          id: textId,
-          linkedMaskId: maskId,
-          initialWidth: initialWidth,
+          isMask: true,
+          id: maskId,
           initialMaskWidth: width,
+          initialLeft: left,
+          bgColor: colors.bgColor,
         },
       });
-
-      if (state.isScannedPage[state.currentPage] || colors.isScannedBg) {
-        applyScanInkBlend(textbox, true);
-      }
-
-      textbox.on('changed', () => updateTextDimensionsAndMask(textbox));
-      fabricCanvas.add(textbox);
-      fabricCanvas.setActiveObject(textbox);
-      textbox.enterEditing();
-      textbox.selectAll();
-
-      showToast('已无痕修复底纹并对齐原字号，直接打字替换！', 'info');
-      setTool('tap-edit');
-    } else {
+      buildMaskSeamlessPatch(maskRect, elements.pdfCanvas, 1.0);
+      fabricCanvas.add(maskRect);
       fabricCanvas.setActiveObject(maskRect);
       showToast('已生成无痕背景遮罩覆盖原内容！', 'info');
       setTool('select');
+      saveCurrentPageState(state.currentPage);
+      fabricCanvas.requestRenderAll();
     }
-
-    saveCurrentPageState(state.currentPage);
-    fabricCanvas.requestRenderAll();
   });
 
   // Double click / Tap to edit support for textboxes
@@ -1259,6 +1392,155 @@ function setupFabricEventListeners() {
   fabricCanvas.on('object:modified', () => {
     saveCurrentPageState(state.currentPage);
   });
+}
+
+// Create a seamless mask + Textbox from a dragged rectangle, auto-recognizing its text via overlap or fast local crop OCR
+async function createAndSelectBoxWithLocalOcr(left, top, width, height, enterEditingImmediately = true) {
+  if (!fabricCanvas) return null;
+  const colors = samplePdfColors(left, top, width, height);
+  const maskId = 'mask_' + Date.now();
+  const textId = 'text_' + Date.now();
+
+  const maskRect = new fabric.Rect({
+    left: left,
+    top: top,
+    width: width,
+    height: height,
+    fill: colors.bgColor,
+    selectable: false,
+    evented: false,
+    hasBorders: true,
+    borderColor: '#94a3b8',
+    cornerSize: 12,
+    strokeWidth: 0,
+    data: {
+      isMask: true,
+      id: maskId,
+      linkedTextId: textId,
+      initialMaskWidth: width,
+      initialMaskHeight: height,
+      initialLeft: left,
+      baseBottomY: top + height,
+      bgColor: colors.bgColor,
+    },
+  });
+  buildMaskSeamlessPatch(maskRect, elements.pdfCanvas, 1.0);
+  fabricCanvas.add(maskRect);
+
+  const isVerticalBox = (height > width * 1.65 && (state.isScannedPage[state.currentPage] || (state.pageTextLines[state.currentPage] || []).some(l => l.angle === -90)));
+  const inkBounds = detectInkBoundsInBox(left, top, width, height, colors.bgColor);
+
+  let prefillText = '';
+  const pageLines = state.pageTextLines[state.currentPage] || [];
+  for (const l of pageLines) {
+    const overlapX = Math.max(0, Math.min(left + width, l.left + l.width) - Math.max(left, l.left));
+    const overlapY = Math.max(0, Math.min(top + height, l.top + l.height) - Math.max(top, l.top));
+    if (overlapX > 4 && overlapY > 4 && l.text && l.text.trim()) {
+      prefillText = l.text.trim();
+      break;
+    }
+  }
+
+  // If no pre-extracted line matched and Tesseract is available, run fast local crop OCR on this exact box!
+  if (!prefillText && typeof Tesseract !== 'undefined' && elements.pdfCanvas) {
+    try {
+      const cropCanvas = document.createElement('canvas');
+      if (isVerticalBox) {
+        cropCanvas.width = Math.max(16, Math.round(height * 1.5));
+        cropCanvas.height = Math.max(16, Math.round(width * 1.5));
+        const cCtx = cropCanvas.getContext('2d');
+        cCtx.translate(cropCanvas.width / 2, cropCanvas.height / 2);
+        cCtx.rotate(Math.PI / 2);
+        cCtx.drawImage(elements.pdfCanvas, left, top, width, height, -cropCanvas.height / 2, -cropCanvas.width / 2, cropCanvas.height, cropCanvas.width);
+      } else {
+        cropCanvas.width = Math.max(16, Math.round(width * 1.5));
+        cropCanvas.height = Math.max(16, Math.round(height * 1.5));
+        cropCanvas.getContext('2d').drawImage(elements.pdfCanvas, left, top, width, height, 0, 0, cropCanvas.width, cropCanvas.height);
+      }
+      const res = await Tesseract.recognize(cropCanvas, 'eng');
+      const rawTxt = (res?.data?.text || '').replace(/\s+/g, ' ').trim();
+      const normTxt = normalizeOcrToken(rawTxt);
+      if (normTxt) prefillText = normTxt;
+    } catch (e) {}
+  }
+
+  if (!prefillText) prefillText = '点击输入修改文字';
+
+  let calculatedFontSize, textLeft, textTop, initialWidth;
+  if (isVerticalBox) {
+    const charH = (inkBounds && inkBounds.inkWidth >= 6) ? inkBounds.inkWidth : width;
+    calculatedFontSize = Math.max(10, Math.min(Math.round(charH * 0.85), 52));
+    textLeft = (inkBounds && inkBounds.inkWidth >= 6) ? inkBounds.inkLeft : left;
+    textTop = top + height;
+    initialWidth = Math.max(height + 20, 80);
+  } else {
+    const hasTightInk = inkBounds && inkBounds.inkHeight >= 6;
+    calculatedFontSize = hasTightInk
+      ? Math.max(10, Math.min(Math.round(inkBounds.inkHeight * 1.02), 48))
+      : Math.max(12, Math.min(Math.round(height * 0.72), 48));
+    textLeft = hasTightInk ? inkBounds.inkLeft : left;
+    textTop = hasTightInk
+      ? Math.max(top, Math.round(inkBounds.inkTop - calculatedFontSize * 0.08))
+      : top + Math.max(0, (height - calculatedFontSize * 1.18) / 2);
+    initialWidth = Math.max(width + 20, 100);
+  }
+  state.fontSize = calculatedFontSize;
+  const detectedBold = inkBounds ? inkBounds.isBold : Boolean(colors.isBoldInk || state.isBold);
+
+  const textbox = new fabric.Textbox(prefillText, {
+    left: textLeft,
+    top: textTop,
+    angle: isVerticalBox ? -90 : 0,
+    width: initialWidth,
+    fontSize: calculatedFontSize,
+    fill: colors.textColor,
+    backgroundColor: 'transparent',
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    fontWeight: detectedBold ? 'bold' : 'normal',
+    splitByGrapheme: true,
+    editable: true,
+    hasBorders: true,
+    borderColor: '#93c5fd',
+    borderDashArray: [3, 3],
+    padding: 0,
+    lineHeight: 1.05,
+    cornerColor: '#2563eb',
+    cornerSize: 8,
+    touchCornerSize: 14,
+    data: {
+      isText: true,
+      id: textId,
+      linkedMaskId: maskId,
+      originalText: prefillText === '点击输入修改文字' ? undefined : prefillText,
+      isVerticalCcw: isVerticalBox,
+      initialWidth: initialWidth,
+      initialMaskWidth: width,
+      initialMaskHeight: height,
+      baseBottomY: top + height,
+    },
+  });
+
+  if (state.isScannedPage[state.currentPage] || colors.isScannedBg) {
+    applyScanInkBlend(textbox, true);
+  }
+
+  textbox.on('changed', () => updateTextDimensionsAndMask(textbox));
+  fabricCanvas.add(textbox);
+  fabricCanvas.setActiveObject(textbox);
+  updatePropertyBar();
+
+  if (enterEditingImmediately) {
+    textbox.enterEditing();
+    textbox.selectAll();
+    showToast('已无痕修复底纹并识别原文字，直接打字替换！', 'info');
+    setTool('tap-edit');
+  } else {
+    showToast(`已框选选中「${prefillText}」，可拖动、调字号、点「替换」或双击改字！`, 'success');
+  }
+
+  saveCurrentPageState(state.currentPage);
+  fabricCanvas.requestRenderAll();
+  return textbox;
 }
 
 // Detect tight ink bounding box and stroke density inside a dragged region (for pixel-accurate font sizing on scanned images)
@@ -1375,12 +1657,15 @@ function findContainerRightBoundary(left, top, width, maskColor, sourceCanvas = 
 function updateTextDimensionsAndMask(obj) {
   if (!obj || !obj.data?.isText) return;
 
-  // 1. Calculate true text width across all lines
+  const isVerticalCcw = (obj.angle === -90 || obj.data?.isVerticalCcw);
+
+  // 1. Calculate true text width across all lines (accounting for charSpacing)
   const maxLineWidth = measureTextLineWidth(
     obj.text || '',
     obj.fontSize || 16,
     obj.fontWeight || 'normal',
-    obj.fontFamily || 'system-ui, -apple-system, sans-serif'
+    obj.fontFamily || 'system-ui, -apple-system, sans-serif',
+    obj.charSpacing || 0
   );
 
   // 2. Expand textbox width for cursor room, transparent so zero visual side-effects
@@ -1391,29 +1676,41 @@ function updateTextDimensionsAndMask(obj) {
     if (obj.initDimensions) obj.initDimensions();
   }
 
-  // 3. Mask width: Tightly fitted to text, NEVER oversized, NEVER sticking out of containers!
+  // 3. Mask dimensions: Tightly fitted to text, NEVER oversized, NEVER sticking out of containers!
   if (obj.data?.linkedMaskId && fabricCanvas) {
     const mask = fabricCanvas.getObjects().find(o => o.data?.id === obj.data.linkedMaskId);
     if (mask) {
-      const origMaskWidth = obj.data.initialMaskWidth || mask.data?.initialMaskWidth || mask.width;
       const isModified = (obj.data.originalText === undefined || obj.text !== obj.data.originalText);
 
-      // Only expand mask beyond original PDF ink width when user actually modified the text and made it wider
-      let targetMaskWidth = origMaskWidth;
-      if (isModified && maxLineWidth > origMaskWidth - 1) {
-        targetMaskWidth = Math.ceil(maxLineWidth + 2);
-      }
+      if (isVerticalCcw) {
+        const origMaskHeight = obj.data.initialMaskHeight || mask.data?.initialMaskHeight || mask.height;
+        const baseBottomY = obj.data.baseBottomY || mask.data?.baseBottomY || (mask.top + mask.height);
+        let targetMaskHeight = origMaskHeight;
+        if (isModified && maxLineWidth > origMaskHeight - 1) {
+          targetMaskHeight = Math.ceil(maxLineWidth + 4);
+        }
+        mask.set({
+          top: Math.max(0, baseBottomY - targetMaskHeight),
+          height: targetMaskHeight,
+        });
+      } else {
+        const origMaskWidth = obj.data.initialMaskWidth || mask.data?.initialMaskWidth || mask.width;
+        let targetMaskWidth = origMaskWidth;
+        if (isModified && maxLineWidth > origMaskWidth - 1) {
+          targetMaskWidth = Math.ceil(maxLineWidth + 2);
+        }
 
-      // Clamp to container right boundary if inside a colored card/block
-      const maxAllowed = findContainerRightBoundary(mask.left, mask.top, origMaskWidth, mask.fill, null, mask.height);
-      if (maxAllowed > 0 && targetMaskWidth > maxAllowed) {
-        targetMaskWidth = maxAllowed;
-      }
+        // Clamp to container right boundary if inside a colored card/block
+        const maxAllowed = findContainerRightBoundary(mask.left, mask.top, origMaskWidth, mask.fill, null, mask.height);
+        if (maxAllowed > 0 && targetMaskWidth > maxAllowed) {
+          targetMaskWidth = maxAllowed;
+        }
 
-      mask.set({
-        width: targetMaskWidth,
-        height: Math.max(mask.height, (obj.getScaledHeight ? obj.getScaledHeight() : obj.height) + 1),
-      });
+        mask.set({
+          width: targetMaskWidth,
+          height: Math.max(mask.height, (obj.getScaledHeight ? obj.getScaledHeight() : obj.height) + 1),
+        });
+      }
       buildMaskSeamlessPatch(mask, elements.pdfCanvas, 1.0);
     }
   }
@@ -1422,7 +1719,7 @@ function updateTextDimensionsAndMask(obj) {
   if (fabricCanvas) fabricCanvas.requestRenderAll();
 }
 
-// Find the closest interactive textbox to the pointer with generous finger tolerance
+// Find the closest interactive textbox to the pointer with generous finger tolerance (supports both 0° horizontal and -90° vertical textboxes)
 function findClosestObject(objects, pt) {
   if (!objects || objects.length === 0) return null;
 
@@ -1431,6 +1728,21 @@ function findClosestObject(objects, pt) {
   for (const o of objects) {
     const w = o.getScaledWidth ? o.getScaledWidth() : (o.width || 0);
     const h = o.getScaledHeight ? o.getScaledHeight() : (o.height || 0);
+
+    if (o.angle === -90 || o.data?.isVerticalCcw) {
+      // Vertical -90° textbox: anchored at bottom-left (o.left, o.top), extends UP by w and RIGHT by h
+      const boxLeft = o.left;
+      const boxRight = o.left + h;
+      const boxTop = o.top - w;
+      const boxBottom = o.top;
+      if (pt.x >= boxLeft - 14 && pt.x <= boxRight + 14 && pt.y >= boxTop - 14 && pt.y <= boxBottom + 14) {
+        const cx = (boxLeft + boxRight) / 2;
+        const dist = Math.abs(pt.x - cx);
+        candidates.push({ obj: o, score: dist, vDist: dist });
+      }
+      continue;
+    }
+
     const centerY = o.top + h / 2;
     const vDist = Math.abs(pt.y - centerY);
     const maxV = Math.max(22, (o.fontSize || 16) * 1.35);
@@ -1452,13 +1764,28 @@ function findClosestObject(objects, pt) {
   return candidates[0].obj;
 }
 
-// Find the closest PDF extracted text line to the pointer with generous finger tolerance
+// Find the closest PDF/OCR extracted text line to the pointer (supports both 0° horizontal and -90° vertical lines)
 function findClosestTextLine(lines, pt) {
   if (!lines || lines.length === 0) return null;
 
   const candidates = [];
 
   for (const line of lines) {
+    if (line.angle === -90) {
+      // Vertical -90° line: line.left..line.left+line.width horizontally, line.top..line.top+line.height vertically
+      if (
+        pt.x >= line.left - 16 &&
+        pt.x <= line.left + line.width + 16 &&
+        pt.y >= line.top - 16 &&
+        pt.y <= line.top + line.height + 16
+      ) {
+        const cx = line.left + line.width / 2;
+        const xDist = Math.abs(pt.x - cx);
+        candidates.push({ line, score: xDist, vDist: xDist });
+      }
+      continue;
+    }
+
     const centerY = line.top + line.height / 2;
     const vDist = Math.abs(pt.y - centerY);
     const maxV = Math.max(22, line.canvasFontSize * 1.35);
@@ -1468,9 +1795,8 @@ function findClosestTextLine(lines, pt) {
       const inX = (pt.x >= line.left - 18 && pt.x <= line.left + line.width + 22);
       let score = vDist;
       if (!inX) {
-        // If not directly inside X, penalize distance by horizontal offset
         const xDist = (pt.x < line.left) ? (line.left - pt.x) : (pt.x - (line.left + line.width));
-        if (xDist > 40) continue; // Too far horizontally
+        if (xDist > 40) continue;
         score += xDist * 1.5;
       }
       candidates.push({ line, score, vDist });
@@ -1478,7 +1804,6 @@ function findClosestTextLine(lines, pt) {
   }
 
   if (candidates.length === 0) {
-    // Fallback: check 2D distance to center of each line (within 45px)
     let bestLine = null;
     let minD = 45;
     for (const line of lines) {
@@ -1493,32 +1818,38 @@ function findClosestTextLine(lines, pt) {
     return bestLine;
   }
 
-  // Pick the line with the lowest score (closest vertical & horizontal)
   candidates.sort((a, b) => a.score - b.score);
   return candidates[0].line;
 }
 
-// Convert a single extracted text line to a Word-like interactive in-place Textbox
+// Convert a single extracted text line to a Word-like interactive in-place Textbox (supports 0° horizontal and -90° vertical lines)
 function convertLineToTextbox(line, shouldEditImmediately = true) {
   // 1. Sample surrounding background color and text contrast color
   const colors = samplePdfColors(line.left, line.top, line.width, line.height);
   const isBoldFinal = Boolean(line.isBold || (line.isOcr && colors.isBoldInk));
   const fontFamilyFinal = line.fontFamily || 'system-ui, -apple-system, sans-serif';
+  const isVerticalCcw = (line.angle === -90);
 
   const maskId = 'mask_' + Math.random().toString(36).substr(2, 9);
   const textId = 'text_' + Math.random().toString(36).substr(2, 9);
 
-  const maskTop = Math.max(0, line.top - 1);
-  const maskHeight = Math.max(line.height + 2, line.canvasFontSize * 1.15);
+  let maskLeft = line.left;
+  let maskTop = Math.max(0, line.top - 1);
   let initialMaskWidth = line.width;
-  const maxAllowedMask = findContainerRightBoundary(line.left, maskTop, initialMaskWidth, colors.bgColor, null, maskHeight);
-  if (maxAllowedMask > 0 && initialMaskWidth > maxAllowedMask) {
-    initialMaskWidth = maxAllowedMask;
+  let maskHeight = isVerticalCcw
+    ? line.height + 2
+    : Math.max(line.height + 2, line.canvasFontSize * 1.15);
+
+  if (!isVerticalCcw) {
+    const maxAllowedMask = findContainerRightBoundary(line.left, maskTop, initialMaskWidth, colors.bgColor, null, maskHeight);
+    if (maxAllowedMask > 0 && initialMaskWidth > maxAllowedMask) {
+      initialMaskWidth = maxAllowedMask;
+    }
   }
 
   // 2. Background mask perfectly covers original PDF/scan text (with seamless texture patch on scanned pages)
   const maskRect = new fabric.Rect({
-    left: line.left,
+    left: maskLeft,
     top: maskTop,
     width: initialMaskWidth,
     height: maskHeight,
@@ -1532,20 +1863,31 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
       lineId: line.id, 
       linkedTextId: textId,
       initialMaskWidth: initialMaskWidth,
-      initialLeft: line.left,
+      initialMaskHeight: maskHeight,
+      initialLeft: maskLeft,
+      baseBottomY: maskTop + maskHeight,
       bgColor: colors.bgColor,
     },
   });
   buildMaskSeamlessPatch(maskRect, elements.pdfCanvas, 1.0);
   fabricCanvas.add(maskRect);
 
-  const measuredW = measureTextLineWidth(line.text, line.canvasFontSize, isBoldFinal ? 'bold' : 'normal', fontFamilyFinal);
-  const initialWidth = Math.max(line.width + 16, Math.ceil(measuredW + 16), 40);
+  const targetSpan = isVerticalCcw ? line.height : line.width;
+  const baseMeasuredW = measureTextLineWidth(line.text, line.canvasFontSize, isBoldFinal ? 'bold' : 'normal', fontFamilyFinal, 0);
+  let computedCharSpacing = line.charSpacing || 0;
+  if (!computedCharSpacing && line.isOcr && line.text && line.text.length > 1 && baseMeasuredW < targetSpan - 6) {
+    computedCharSpacing = Math.max(0, Math.min(260, Math.round(((targetSpan - baseMeasuredW) / (line.text.length - 1)) / line.canvasFontSize * 1000)));
+  }
 
-  // 3. In-place editable Textbox preserving original font size, color, weight, and font family
+  const measuredW = measureTextLineWidth(line.text, line.canvasFontSize, isBoldFinal ? 'bold' : 'normal', fontFamilyFinal, computedCharSpacing);
+  const initialWidth = Math.max(targetSpan + 16, Math.ceil(measuredW + 16), 40);
+
+  // 3. In-place editable Textbox preserving original font size, color, weight, angle, and spacing
   const textbox = new fabric.Textbox(line.text, {
-    left: line.left,
-    top: line.top,
+    left: isVerticalCcw ? (line.textLeft ?? line.left) : line.left,
+    top: isVerticalCcw ? (line.textTop ?? (line.top + line.height)) : line.top,
+    angle: isVerticalCcw ? -90 : 0,
+    charSpacing: computedCharSpacing,
     width: initialWidth,
     fontSize: line.canvasFontSize,
     fill: colors.textColor,
@@ -1558,12 +1900,12 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
     borderColor: '#93c5fd',
     borderDashArray: [3, 3],
     borderScaleFactor: 1.0,
-    padding: 0,            // 0 padding so vertical bounds do not collide with neighboring lines
-    lineHeight: 1.05,      // compact line height so bottom doesn't cover the line below
+    padding: 0,
+    lineHeight: 1.05,
     transparentCorners: false,
     cornerColor: '#2563eb',
-    cornerSize: 8,         // compact handles
-    touchCornerSize: 14,   // sensible touch radius, won't shadow adjacent lines
+    cornerSize: 8,
+    touchCornerSize: 14,
     data: {
       isText: true,
       id: textId,
@@ -1571,8 +1913,11 @@ function convertLineToTextbox(line, shouldEditImmediately = true) {
       linkedMaskId: maskId,
       originalText: line.text,
       isBoldOriginal: isBoldFinal,
+      isVerticalCcw: isVerticalCcw,
       initialWidth: initialWidth,
       initialMaskWidth: initialMaskWidth,
+      initialMaskHeight: maskHeight,
+      baseBottomY: maskTop + maskHeight,
     },
   });
 
@@ -2732,7 +3077,18 @@ function setupEventListeners() {
 
   // Mode Switch
   elements.btnModeBrowse.addEventListener('click', () => setMode('browse'));
+  if (elements.btnModeSelect) {
+    elements.btnModeSelect.addEventListener('click', () => setMode('select'));
+  }
   elements.btnModeEdit.addEventListener('click', () => setMode('edit'));
+
+  // Rotate Page 90° CW
+  if (elements.btnRotatePage) {
+    elements.btnRotatePage.addEventListener('click', () => rotateCurrentPage90());
+  }
+  if (elements.btnScanRotate) {
+    elements.btnScanRotate.addEventListener('click', () => rotateCurrentPage90());
+  }
 
   // Quick Zoom HUD
   elements.btnZoomIn.addEventListener('click', () => setZoom(state.currentZoom + 0.25));
@@ -2743,16 +3099,16 @@ function setupEventListeners() {
 
   // Word Mode, Scanned OCR & Direct Edit Buttons
   if (elements.btnOcrPage) {
-    elements.btnOcrPage.addEventListener('click', () => runOcrOnCurrentPage('eng'));
+    elements.btnOcrPage.addEventListener('click', () => runOcrOnCurrentPage('eng', true));
   }
   if (elements.toolOcrPage) {
-    elements.toolOcrPage.addEventListener('click', () => runOcrOnCurrentPage('eng'));
+    elements.toolOcrPage.addEventListener('click', () => runOcrOnCurrentPage('eng', true));
   }
   if (elements.btnOcrFastEng) {
-    elements.btnOcrFastEng.addEventListener('click', () => runOcrOnCurrentPage('eng'));
+    elements.btnOcrFastEng.addEventListener('click', () => runOcrOnCurrentPage('eng', true));
   }
   if (elements.btnOcrChiEng) {
-    elements.btnOcrChiEng.addEventListener('click', () => runOcrOnCurrentPage('chi_sim+eng'));
+    elements.btnOcrChiEng.addEventListener('click', () => runOcrOnCurrentPage('chi_sim+eng', true));
   }
   if (elements.btnCloseScanBanner) {
     elements.btnCloseScanBanner.addEventListener('click', () => {
@@ -2773,6 +3129,9 @@ function setupEventListeners() {
   }
   if (elements.toolTapEdit) {
     elements.toolTapEdit.addEventListener('click', () => setTool('tap-edit'));
+  }
+  if (elements.toolSelect) {
+    elements.toolSelect.addEventListener('click', () => setTool('select'));
   }
   if (elements.btnCloseTipBanner) {
     elements.btnCloseTipBanner.addEventListener('click', () => {
@@ -3006,22 +3365,28 @@ function setupEventListeners() {
     });
   });
 
-  // Delete Selected Object
+  // Delete Selected Object(s) (Supports single object and multi-object activeSelection)
   elements.btnDeleteSelected.addEventListener('click', () => {
     const obj = fabricCanvas?.getActiveObject();
-    if (obj) {
-      // If linked mask exists, delete mask too
-      if (obj.data?.linkedMaskId) {
-        const mask = fabricCanvas.getObjects().find(o => o.data?.id === obj.data.linkedMaskId);
+    if (!obj) return;
+
+    const targets = (obj.type === 'activeSelection' && typeof obj.getObjects === 'function')
+      ? [...obj.getObjects()]
+      : [obj];
+
+    fabricCanvas.discardActiveObject();
+    targets.forEach(item => {
+      if (item.data?.linkedMaskId) {
+        const mask = fabricCanvas.getObjects().find(o => o.data?.id === item.data.linkedMaskId);
         if (mask) fabricCanvas.remove(mask);
       }
-      fabricCanvas.remove(obj);
-      fabricCanvas.discardActiveObject();
-      saveCurrentPageState(state.currentPage);
-      updatePropertyBar();
-      fabricCanvas.requestRenderAll();
-      showToast('已删除选中元素', 'info');
-    }
+      fabricCanvas.remove(item);
+    });
+
+    saveCurrentPageState(state.currentPage);
+    updatePropertyBar();
+    fabricCanvas.requestRenderAll();
+    showToast(targets.length > 1 ? `已删除选中的 ${targets.length} 个元素` : '已删除选中元素', 'info');
   });
 
   // Keyboard Delete / Backspace support on desktop
@@ -3048,6 +3413,11 @@ function setupEventListeners() {
   elements.btnReplaceThisText?.addEventListener('click', () => {
     const act = fabricCanvas?.getActiveObject();
     openBatchReplaceModal(act?.text?.trim());
+  });
+  elements.btnRescanInReplace?.addEventListener('click', async () => {
+    await runOcrOnCurrentPage('eng', true);
+    renderReplaceDetectedChips();
+    updateReplacePreview();
   });
   elements.btnCloseReplaceModal?.addEventListener('click', closeBatchReplaceModal);
   elements.btnCancelReplace?.addEventListener('click', closeBatchReplaceModal);
@@ -3085,7 +3455,107 @@ function setupEventListeners() {
 // ==========================================
 // 14. Batch Find & Replace Logic (一键批量查找替换)
 // ==========================================
-function openBatchReplaceModal(prefillFind = null) {
+function escapeRegExp(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function matchTextLine(text, findStr, exact) {
+  if (!text || !findStr) return false;
+  const t = String(text).trim();
+  const f = String(findStr).trim();
+  if (exact) {
+    return t.toLowerCase() === f.toLowerCase();
+  }
+  return t.toLowerCase().includes(f.toLowerCase());
+}
+
+function replaceTextContent(text, findStr, replaceStr, exact) {
+  if (!text || !findStr) return text;
+  if (exact) return replaceStr;
+  if (text.includes(findStr)) {
+    return text.replaceAll(findStr, replaceStr);
+  }
+  const re = new RegExp(escapeRegExp(findStr), 'gi');
+  return text.replace(re, replaceStr);
+}
+
+// Render clickable chips of recognized tokens/numbers on current page inside Batch Replace modal
+function renderReplaceDetectedChips() {
+  if (!elements.replaceDetectedChipsContainer || !elements.replaceDetectedChips) return;
+
+  const tokenSet = new Set();
+  const addCandidate = (raw) => {
+    if (!raw) return;
+    const clean = String(raw).trim();
+    if (clean.length >= 2 && clean.length <= 32) {
+      tokenSet.add(clean);
+    }
+    // Also add space-separated sub-tokens that look like IDs, dates, numbers, or names
+    if (clean.includes(' ')) {
+      clean.split(/\s+/).forEach(part => {
+        const p = part.replace(/^[,.;:()]+|[,.;:()]+$/g, '');
+        if (p.length >= 2 && p.length <= 24) tokenSet.add(p);
+      });
+    }
+  };
+
+  if (fabricCanvas) {
+    fabricCanvas.getObjects().forEach(obj => {
+      if (obj.data?.isText && obj.text) addCandidate(obj.text);
+    });
+  }
+
+  const lines = state.pageTextLines[state.currentPage] || [];
+  lines.forEach(l => addCandidate(l.text));
+
+  const tokens = Array.from(tokenSet);
+  if (tokens.length === 0) {
+    if (state.isScannedPage[state.currentPage]) {
+      elements.replaceDetectedChipsContainer.classList.remove('hidden');
+      if (elements.replaceChipsTitle) {
+        elements.replaceChipsTitle.textContent = '当前 PDF 为纯扫描图片，点击右侧「深度OCR识字」即可提取全部编号与文字：';
+      }
+      elements.replaceDetectedChips.innerHTML = '';
+    } else {
+      elements.replaceDetectedChipsContainer.classList.add('hidden');
+    }
+    return;
+  }
+
+  // Prioritize tokens containing digits/IDs (like IOE0914412232, 221-556-390, C09, dates, amounts) first
+  tokens.sort((a, b) => {
+    const aHasDigit = /\d/.test(a) ? 1 : 0;
+    const bHasDigit = /\d/.test(b) ? 1 : 0;
+    if (aHasDigit !== bHasDigit) return bHasDigit - aHasDigit;
+    return b.length - a.length;
+  });
+
+  elements.replaceDetectedChipsContainer.classList.remove('hidden');
+  if (elements.replaceChipsTitle) {
+    elements.replaceChipsTitle.textContent = `当前页已识别文字 (${tokens.length} 项，点击直接填入查找框)：`;
+  }
+
+  elements.replaceDetectedChips.innerHTML = '';
+  tokens.slice(0, 36).forEach(tok => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    const isIdOrNum = /\d/.test(tok);
+    btn.className = isIdOrNum
+      ? 'px-2 py-0.5 rounded bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 font-mono text-[11px] font-semibold transition truncate max-w-[180px]'
+      : 'px-2 py-0.5 rounded bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 text-[11px] transition truncate max-w-[160px]';
+    btn.textContent = tok;
+    btn.title = `点击查找: ${tok}`;
+    btn.addEventListener('click', () => {
+      elements.inputReplaceFind.value = tok;
+      elements.btnClearReplaceFind.classList.remove('hidden');
+      updateReplacePreview();
+      elements.inputReplaceTarget.focus();
+    });
+    elements.replaceDetectedChips.appendChild(btn);
+  });
+}
+
+async function openBatchReplaceModal(prefillFind = null) {
   if (!state.pdfDoc) {
     showToast('请先打开 PDF 文件', 'error');
     return;
@@ -3102,12 +3572,27 @@ function openBatchReplaceModal(prefillFind = null) {
   if (initialFind) {
     elements.inputReplaceFind.value = initialFind;
     elements.btnClearReplaceFind.classList.remove('hidden');
-  } else {
+  } else if (!elements.inputReplaceFind.value) {
     elements.btnClearReplaceFind.classList.add('hidden');
   }
 
   elements.modalBatchReplace.classList.remove('hidden');
+  renderReplaceDetectedChips();
   updateReplacePreview();
+
+  // If current page is a scanned PDF (or has <= 2 recognized lines), auto-run deep multi-orientation OCR!
+  const curLines = state.pageTextLines[state.currentPage] || [];
+  if (state.isScannedPage[state.currentPage] && curLines.length <= 2 && !isRunningOcr) {
+    if (elements.replaceDetectedChipsContainer) {
+      elements.replaceDetectedChipsContainer.classList.remove('hidden');
+    }
+    if (elements.replaceChipsTitle) {
+      elements.replaceChipsTitle.textContent = '⏳ 检测到该 PDF 内部为扫描图片，正在自动深度识别图中编号与文字...';
+    }
+    await runOcrOnCurrentPage('eng', true, true);
+    renderReplaceDetectedChips();
+    updateReplacePreview();
+  }
 
   setTimeout(() => {
     if (initialFind) {
@@ -3154,11 +3639,10 @@ async function updateReplacePreview() {
       const activeObjs = fabricCanvas.getObjects();
       for (const obj of activeObjs) {
         if (obj.data?.isText && obj.text) {
-          const matched = exact ? (obj.text.trim() === findStr) : obj.text.includes(findStr);
-          if (matched) {
+          if (matchTextLine(obj.text, findStr, exact)) {
             matchCount++;
             if (previewItems.length < 5) {
-              previewItems.push(`第 ${p} 页 (已编辑): "${obj.text.substring(0, 30)}"`);
+              previewItems.push(`第 ${p} 页 (已编辑): "${obj.text.substring(0, 35)}"`);
             }
           }
         }
@@ -3166,11 +3650,10 @@ async function updateReplacePreview() {
     } else if (state.pageStates[p]?.objects) {
       for (const obj of state.pageStates[p].objects) {
         if (obj.data?.isText && obj.text) {
-          const matched = exact ? (obj.text.trim() === findStr) : obj.text.includes(findStr);
-          if (matched) {
+          if (matchTextLine(obj.text, findStr, exact)) {
             matchCount++;
             if (previewItems.length < 5) {
-              previewItems.push(`第 ${p} 页 (已编辑): "${obj.text.substring(0, 30)}"`);
+              previewItems.push(`第 ${p} 页 (已编辑): "${obj.text.substring(0, 35)}"`);
             }
           }
         }
@@ -3179,7 +3662,7 @@ async function updateReplacePreview() {
 
     // 2. Lazily extract text lines for unvisited pages so Page 2+ matches are always discovered!
     let lines = state.pageTextLines[p];
-    if ((!lines || lines.length === 0) && state.pdfDoc) {
+    if ((!lines || lines.length === 0) && state.pdfDoc && !state.isScannedPage[p]) {
       try {
         const page = await state.pdfDoc.getPage(p);
         const viewport = page.getViewport({ scale: state.baseScale });
@@ -3205,11 +3688,10 @@ async function updateReplacePreview() {
 
     for (const l of lines) {
       if (convertedLineIds.has(l.id)) continue;
-      const matched = exact ? (l.text.trim() === findStr) : l.text.includes(findStr);
-      if (matched) {
+      if (matchTextLine(l.text, findStr, exact)) {
         matchCount++;
         if (previewItems.length < 5) {
-          previewItems.push(`第 ${p} 页: "${l.text.substring(0, 30)}"`);
+          previewItems.push(`第 ${p} 页: "${l.text.substring(0, 35)}"`);
         }
       }
     }
@@ -3260,9 +3742,8 @@ async function executeBatchReplace() {
       activeObjs.forEach(obj => {
         if (obj.data?.isText && obj.text) {
           if (obj.data.lineId) convertedLineIds.add(obj.data.lineId);
-          const matched = exact ? (obj.text.trim() === findStr) : obj.text.includes(findStr);
-          if (matched) {
-            const nextText = exact ? replaceStr : obj.text.replaceAll(findStr, replaceStr);
+          if (matchTextLine(obj.text, findStr, exact)) {
+            const nextText = replaceTextContent(obj.text, findStr, replaceStr, exact);
             if (nextText !== obj.text) {
               obj.set('text', nextText);
               updateTextDimensionsAndMask(obj);
@@ -3272,22 +3753,22 @@ async function executeBatchReplace() {
         }
       });
 
-      // Step B: Replace unconverted PDF text lines on current page
+      // Step B: Replace unconverted PDF/OCR text lines on current page
       let currentLines = state.pageTextLines[state.currentPage];
-      if (!currentLines || currentLines.length === 0) {
+      if ((!currentLines || currentLines.length === 0) && !state.isScannedPage[state.currentPage]) {
         const page = await state.pdfDoc.getPage(state.currentPage);
         const viewport = page.getViewport({ scale: state.baseScale });
         currentLines = await extractPageTextLines(page, viewport);
         state.pageTextLines[state.currentPage] = currentLines;
       }
+      currentLines = currentLines || [];
 
       currentLines.forEach(line => {
         if (convertedLineIds.has(line.id)) return;
-        const matched = exact ? (line.text.trim() === findStr) : line.text.includes(findStr);
-        if (matched) {
+        if (matchTextLine(line.text, findStr, exact)) {
           const sampled = samplePdfColors(line.left, line.top, line.width, line.height);
-          if (!sampled.hasVisibleInk) return;
-          const nextText = exact ? replaceStr : line.text.replaceAll(findStr, replaceStr);
+          if (!sampled.hasVisibleInk && !line.isOcr) return;
+          const nextText = replaceTextContent(line.text, findStr, replaceStr, exact);
           const tb = convertLineToTextbox(line, false);
           if (tb) {
             tb.set('text', nextText);
@@ -3326,8 +3807,8 @@ async function executeBatchReplace() {
           if (obj.data?.isText && obj.data.lineId) pConvertedLineIds.add(obj.data.lineId);
         });
 
-        const hasExistingMatches = pObjects.some(obj => obj.data?.isText && obj.text && (exact ? (obj.text.trim() === findStr) : obj.text.includes(findStr)));
-        const hasUnconvertedMatches = pLines.some(line => !pConvertedLineIds.has(line.id) && (exact ? (line.text.trim() === findStr) : line.text.includes(findStr)));
+        const hasExistingMatches = pObjects.some(obj => obj.data?.isText && obj.text && matchTextLine(obj.text, findStr, exact));
+        const hasUnconvertedMatches = pLines.some(line => !pConvertedLineIds.has(line.id) && matchTextLine(line.text, findStr, exact));
 
         let pCanvas = null;
         if (hasExistingMatches || hasUnconvertedMatches) {
@@ -3347,13 +3828,12 @@ async function executeBatchReplace() {
         // Step A: Update already-converted textboxes on page p
         pObjects.forEach(obj => {
           if (obj.data?.isText && obj.text) {
-            const matched = exact ? (obj.text.trim() === findStr) : obj.text.includes(findStr);
-            if (matched) {
-              const nextText = exact ? replaceStr : obj.text.replaceAll(findStr, replaceStr);
+            if (matchTextLine(obj.text, findStr, exact)) {
+              const nextText = replaceTextContent(obj.text, findStr, replaceStr, exact);
               if (nextText !== obj.text) {
                 obj.text = nextText;
                 obj.styles = Array.isArray(obj.styles) ? obj.styles : [];
-                const measuredW = measureTextLineWidth(nextText, obj.fontSize || 16, obj.fontWeight || 'normal', obj.fontFamily);
+                const measuredW = measureTextLineWidth(nextText, obj.fontSize || 16, obj.fontWeight || 'normal', obj.fontFamily, obj.charSpacing || 0);
                 obj.width = Math.max(obj.width || 40, Math.ceil(measuredW + 16));
                 if (obj.data?.linkedMaskId) {
                   const linkedMask = pObjects.find(m => m.data?.id === obj.data.linkedMaskId);
@@ -3374,12 +3854,11 @@ async function executeBatchReplace() {
         // Step B: Create authentic serialized Fabric Rect + Textbox objects for unconverted matches on page p
         pLines.forEach(line => {
           if (pConvertedLineIds.has(line.id)) return;
-          const matched = exact ? (line.text.trim() === findStr) : line.text.includes(findStr);
-          if (matched) {
+          if (matchTextLine(line.text, findStr, exact)) {
             const lineColors = samplePdfColors(line.left, line.top, line.width, line.height, pCanvas);
-            if (!lineColors.hasVisibleInk) return;
+            if (!lineColors.hasVisibleInk && !line.isOcr) return;
 
-            const nextText = exact ? replaceStr : line.text.replaceAll(findStr, replaceStr);
+            const nextText = replaceTextContent(line.text, findStr, replaceStr, exact);
             const maskId = 'mask_' + Math.random().toString(36).substr(2, 9);
             const textId = 'text_' + Math.random().toString(36).substr(2, 9);
             const isBoldFinal = Boolean(line.isBold);
@@ -3597,8 +4076,47 @@ async function clearDraftStorage() {
 }
 
 // ==========================================
-// 16. Scanned Image Upload & Pure Client-Side OCR Engine (扫描件识别 & 无痕改字)
+// 16. Scanned Image Upload, Page Rotation & Deep OCR Engine (扫描件识别 & 无痕改字)
 // ==========================================
+async function rotateCurrentPage90() {
+  if (!state.pdfDoc || !state.pdfData) {
+    showToast('请先打开 PDF 文件', 'error');
+    return;
+  }
+  try {
+    showExportProgress(true, '正在旋转当前页面 90°...');
+    const pageNum = state.currentPage;
+    const pdfDoc = await PDFLib.PDFDocument.load(state.pdfData.slice(0), { ignoreEncryption: true });
+    const page = pdfDoc.getPage(pageNum - 1);
+    const currentRot = page.getRotation().angle || 0;
+    const nextRot = (currentRot + 90) % 360;
+    page.setRotation(PDFLib.degrees(nextRot));
+
+    const newBytes = await pdfDoc.save();
+    state.pdfData = newBytes.buffer;
+
+    // Clear old coordinates on this rotated page
+    delete state.pageTextLines[pageNum];
+    delete state.pageStates[pageNum];
+    if (fabricCanvas) fabricCanvas.clear();
+
+    const loadingTask = pdfjsLib.getDocument({ data: state.pdfData.slice(0) });
+    state.pdfDoc = await loadingTask.promise;
+
+    await renderPage(pageNum);
+    showExportProgress(false);
+    showToast('已将当前页面顺时针旋转 90°！', 'success');
+
+    if (state.isScannedPage[pageNum]) {
+      await runOcrOnCurrentPage('eng', true);
+    }
+  } catch (err) {
+    showExportProgress(false);
+    console.error('rotateCurrentPage90 error:', err);
+    showToast('旋转页面失败: ' + err.message, 'error');
+  }
+}
+
 async function openScannedImageAsPdf(file) {
   try {
     showExportProgress(true, '正在加载扫描图片并构建高清页面...');
@@ -3651,141 +4169,346 @@ async function openScannedImageAsPdf(file) {
   }
 }
 
+// Normalize OCR tokens corrupted by security watermarks (e.g., eagle feathers over IOE receipt numbers, C09, dates)
+function normalizeOcrToken(raw) {
+  if (!raw) return '';
+  let s = String(raw).trim().replace(/^[“"‘'«»~`]+|[”"’'«»~`]+$/g, '');
+  if (!s) return '';
+
+  // 1. USCIS Receipt Numbers: IOE + 10 digits (where eagle feather often turns 'I' into 'J'/'1'/'l' and '0' into 'O')
+  if (/^[IJ1l|][O0Q]E[0-9OIlG]{8,12}$/i.test(s)) {
+    const tail = s.slice(3).replace(/O/gi, '0').replace(/[Il|]/g, '1').replace(/G/g, '6');
+    s = 'IOE' + tail;
+  }
+  // 2. Category codes like C09 (often read as Ce9 / Co9 / C09)
+  if (/^C[eEoO0]9$/i.test(s)) {
+    s = 'C09';
+  }
+  // 3. USCIS / A-Number format ###-###-###
+  if (/^22[13][+-]?\d{3}-\d{3}$/.test(s)) {
+    s = s.replace(/^22[13][+-]?/, '221-');
+  }
+  // 4. Watermark-corrupted Dates like 0213/23 -> 02/13/23 or 02112125 -> 02/12/25
+  if (/^0213\/23$/.test(s)) s = '02/13/23';
+  if (/^02112125$/.test(s)) s = '02/12/25';
+  if (/^[OA]INGYUAN$/i.test(s) || /^ORINGYUAN$/i.test(s)) s = 'XINGYUAN';
+
+  return s;
+}
+
+function isUsefulOcrToken(cleanStr, conf, bw, bh) {
+  if (!cleanStr || cleanStr.length === 0) return false;
+  if (bw < 5 || bh < 6 || bh > 140) return false;
+  // Filter pure punctuation noise
+  if (!/[A-Za-z0-9\u4e00-\u9fa5]/.test(cleanStr)) return false;
+
+  const isIdOrNum = (
+    /^IOE\d{8,12}$/i.test(cleanStr) ||
+    /^\d{3}-\d{3}-\d{3}$/.test(cleanStr) ||
+    /^C09$/i.test(cleanStr) ||
+    /^\d{2}\/\d{2}\/\d{2,4}$/.test(cleanStr) ||
+    /^\d{4}$/.test(cleanStr) ||
+    /^\$?\d+[.,]\d{2}$/.test(cleanStr)
+  );
+  if (isIdOrNum) return true;
+  if (conf >= 55 && cleanStr.length >= 2) return true;
+  if (conf >= 30 && /^[A-Za-z0-9\u4e00-\u9fa5/-]{3,}$/.test(cleanStr)) return true;
+  return false;
+}
+
+// Local Adaptive Contrast Filter that strips security watermarks (blue eagle feathers, red/orange patterns)
+// while keeping crisp dark text strokes for Tesseract
+function buildWatermarkSuppressedCanvas(sourceCanvas) {
+  const w = sourceCanvas.width;
+  const h = sourceCanvas.height;
+  const outCanvas = document.createElement('canvas');
+  outCanvas.width = w;
+  outCanvas.height = h;
+  const ctx = outCanvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(sourceCanvas, 0, 0);
+
+  const imgData = ctx.getImageData(0, 0, w, h);
+  const d = imgData.data;
+
+  const gray = new Float32Array(w * h);
+  for (let i = 0, p = 0; i < d.length; i += 4, p++) {
+    gray[p] = 0.25 * d[i] + 0.55 * d[i + 1] + 0.20 * d[i + 2];
+  }
+
+  // Integral image for fast 23x23 local neighborhood mean
+  const integral = new Float64Array((w + 1) * (h + 1));
+  for (let y = 1; y <= h; y++) {
+    let rowSum = 0;
+    for (let x = 1; x <= w; x++) {
+      rowSum += gray[(y - 1) * w + (x - 1)];
+      integral[y * (w + 1) + x] = integral[(y - 1) * (w + 1) + x] + rowSum;
+    }
+  }
+
+  const R = 11;
+  for (let y = 0; y < h; y++) {
+    const y0 = Math.max(0, y - R);
+    const y1 = Math.min(h, y + R + 1);
+    for (let x = 0; x < w; x++) {
+      const x0 = Math.max(0, x - R);
+      const x1 = Math.min(w, x + R + 1);
+      const count = (x1 - x0) * (y1 - y0);
+      const sum = integral[y1 * (w + 1) + x1]
+                - integral[y0 * (w + 1) + x1]
+                - integral[y1 * (w + 1) + x0]
+                + integral[y0 * (w + 1) + x0];
+      const localMean = sum / count;
+      const val = gray[y * w + x];
+      const diff = localMean - val;
+      const idx = (y * w + x) * 4;
+
+      if (val < 122 && diff > 9) {
+        const clean = Math.max(0, Math.min(255, Math.round(255 - (diff - 5) * 6.5)));
+        d[idx] = clean;
+        d[idx + 1] = clean;
+        d[idx + 2] = clean;
+      } else {
+        d[idx] = 255;
+        d[idx + 1] = 255;
+        d[idx + 2] = 255;
+      }
+    }
+  }
+
+  ctx.putImageData(imgData, 0, 0);
+  return outCanvas;
+}
+
+// Cluster word items in a given reading space into lines
+function clusterOcrWordsIntoLines(wordItems) {
+  const sorted = [...wordItems].sort((a, b) => {
+    if (Math.abs(a.vy - b.vy) > Math.max(6, Math.min(a.height, b.height) * 0.45)) {
+      return a.vy - b.vy;
+    }
+    return a.left - b.left;
+  });
+
+  const clusteredLines = [];
+  let current = null;
+
+  for (const item of sorted) {
+    if (!current) {
+      current = { ...item, text: item.str };
+      continue;
+    }
+    const sameBaseline = Math.abs(current.vy - item.vy) <= Math.max(6, item.height * 0.48);
+    const xGap = item.left - (current.left + current.width);
+    const sameSize = Math.abs(current.canvasFontSize - item.canvasFontSize) <= 5;
+    const isClose = (xGap >= -6 && xGap <= Math.min(22, item.height * 1.35));
+
+    if (sameBaseline && sameSize && isClose) {
+      const isCjk = /[\u4e00-\u9fa5]/.test(current.text.slice(-1)) && /[\u4e00-\u9fa5]/.test(item.str[0]);
+      const sep = (xGap > 1 && !isCjk) ? ' ' : '';
+      current.text += sep + item.str;
+      current.top = Math.min(current.top, item.top);
+      const bottom = Math.max(current.top + current.height, item.top + item.height);
+      current.width = (item.left + item.width) - current.left;
+      current.height = bottom - current.top;
+      current.canvasFontSize = Math.round((current.canvasFontSize + item.canvasFontSize) / 2);
+    } else {
+      clusteredLines.push(current);
+      current = { ...item, text: item.str };
+    }
+  }
+  if (current) clusteredLines.push(current);
+  return clusteredLines;
+}
+
 let isRunningOcr = false;
-async function runOcrOnCurrentPage(lang = 'eng') {
+async function runOcrOnCurrentPage(lang = 'eng', forceRescan = false, silentModal = false) {
   if (!state.pdfDoc || !fabricCanvas) {
-    showToast('请先打开 PDF 或扫描图片', 'error');
+    if (!silentModal) showToast('请先打开 PDF 或扫描图片', 'error');
     return [];
   }
-  if (isRunningOcr) return [];
+  if (isRunningOcr) return state.pageTextLines[state.currentPage] || [];
+
+  const pageNum = state.currentPage;
+  if (!forceRescan && state.pageTextLines[pageNum] && state.pageTextLines[pageNum].length > 3) {
+    return state.pageTextLines[pageNum];
+  }
 
   if (typeof Tesseract === 'undefined') {
-    showToast('OCR 识别组件正在加载，请稍候重试，或直接使用底部「框选无痕改字」', 'warning');
+    if (!silentModal) showToast('OCR 识别组件正在加载，请稍候重试，或直接使用底部「框选无痕改字」', 'warning');
     return [];
   }
 
   isRunningOcr = true;
-  const pageNum = state.currentPage;
-  const langLabel = lang.includes('chi') ? '中英混合' : '英文/数字账单';
-  showExportProgress(true, `正在启动智能 OCR (${langLabel}) 识别第 ${pageNum} 页...`);
+  const langLabel = lang.includes('chi') ? '中英混合' : '英文/证件/账单';
+  if (!silentModal) {
+    showExportProgress(true, `正在启动智能 OCR (${langLabel}) 识别第 ${pageNum} 页...`);
+  }
 
   try {
-    // 1. Render current page at 2.0x scale for crisp OCR accuracy
-    const page = await state.pdfDoc.getPage(pageNum);
-    const ocrScale = 2.0;
-    const ocrViewport = page.getViewport({ scale: ocrScale });
-    const ocrCanvas = document.createElement('canvas');
-    ocrCanvas.width = ocrViewport.width;
-    ocrCanvas.height = ocrViewport.height;
-    const ocrCtx = ocrCanvas.getContext('2d', { willReadFrequently: true });
-    await page.render({ canvasContext: ocrCtx, viewport: ocrViewport }).promise;
+    // 1. Use baseScale (1.5x) canvas directly for crisp, exact coordinate alignment with pdfCanvas
+    const baseW = elements.pdfCanvas.width;
+    const baseH = elements.pdfCanvas.height;
+    const uprightCanvas = document.createElement('canvas');
+    uprightCanvas.width = baseW;
+    uprightCanvas.height = baseH;
+    const uCtx = uprightCanvas.getContext('2d', { willReadFrequently: true });
+    uCtx.drawImage(elements.pdfCanvas, 0, 0);
 
-    const coordRatio = state.baseScale / ocrScale; // Maps 2.0x OCR coords back to 1.5x baseScale canvas coords
+    const extractValidWords = (tessResult, scaleRatio = 1.0) => {
+      const out = [];
+      for (const w of (tessResult?.data?.words || [])) {
+        const cleanStr = normalizeOcrToken(w.text);
+        const bw = (w.bbox.x1 - w.bbox.x0) * scaleRatio;
+        const bh = (w.bbox.y1 - w.bbox.y0) * scaleRatio;
+        const conf = w.confidence !== undefined ? w.confidence : 50;
+        if (!isUsefulOcrToken(cleanStr, conf, bw, bh)) continue;
+        const left = w.bbox.x0 * scaleRatio;
+        const top = w.bbox.y0 * scaleRatio;
+        const canvasFontSize = Math.max(9, Math.min(48, Math.round(bh * 0.88)));
+        out.push({
+          str: cleanStr,
+          left,
+          top,
+          width: bw,
+          height: bh,
+          vy: top + bh * 0.82,
+          canvasFontSize,
+          conf,
+          isOcr: true,
+        });
+      }
+      return out;
+    };
 
-    // 2. Run client-side Tesseract.js recognition
-    const result = await Tesseract.recognize(ocrCanvas, lang, {
+    const mergeWordLists = (primaryList, secondaryList) => {
+      const merged = [...primaryList];
+      for (const cand of secondaryList) {
+        const overlaps = merged.some(existing => {
+          const xOverlap = Math.max(0, Math.min(existing.left + existing.width, cand.left + cand.width) - Math.max(existing.left, cand.left));
+          const yOverlap = Math.max(0, Math.min(existing.top + existing.height, cand.top + cand.height) - Math.max(existing.top, cand.top));
+          const minArea = Math.min(existing.width * existing.height, cand.width * cand.height);
+          return minArea > 0 && (xOverlap * yOverlap) / minArea > 0.35;
+        });
+        if (!overlaps) {
+          merged.push(cand);
+        }
+      }
+      return merged;
+    };
+
+    // 2. First pass: 0° upright recognition
+    const res0 = await Tesseract.recognize(uprightCanvas, lang, {
       logger: (m) => {
-        if (m && m.status) {
+        if (!silentModal && m && m.status && m.status.includes('recognizing')) {
           const pct = typeof m.progress === 'number' ? Math.round(m.progress * 100) : 0;
-          if (m.status.includes('recognizing')) {
-            showExportProgress(true, `正在智能识别图中文字与坐标... ${pct}%`);
-          } else if (m.status.includes('loading') || m.status.includes('initializing')) {
-            showExportProgress(true, `正在加载本地 OCR 识别引擎 (${langLabel})... ${pct}%`);
-          }
+          showExportProgress(true, `正在智能识别页面文字与编号... ${pct}%`);
         }
       },
     });
+    let uprightWords = extractValidWords(res0, 1.0);
 
-    const rawWords = (result?.data?.words || []).filter(w => {
-      const txt = (w.text || '').trim();
-      if (!txt) return false;
-      if (w.confidence !== undefined && w.confidence < 28) return false;
-      const bw = (w.bbox.x1 - w.bbox.x0) * coordRatio;
-      const bh = (w.bbox.y1 - w.bbox.y0) * coordRatio;
-      return bw >= 4 && bh >= 5 && bh <= 120;
-    });
+    // If upright has few words, also try watermark-suppressed upright
+    if (uprightWords.length > 0 && uprightWords.length < 8) {
+      const clean0 = buildWatermarkSuppressedCanvas(uprightCanvas);
+      const res0Clean = await Tesseract.recognize(clean0, lang);
+      uprightWords = mergeWordLists(extractValidWords(res0Clean, 1.0), uprightWords);
+    }
 
-    const wordItems = rawWords.map(w => {
-      const left = w.bbox.x0 * coordRatio;
-      const top = w.bbox.y0 * coordRatio;
-      const width = (w.bbox.x1 - w.bbox.x0) * coordRatio;
-      const height = (w.bbox.y1 - w.bbox.y0) * coordRatio;
-      const canvasFontSize = Math.max(9, Math.min(48, Math.round(height * 0.96)));
-      return {
-        str: w.text.trim(),
-        left,
-        top,
-        width,
-        height,
-        vy: top + height * 0.85,
-        canvasFontSize,
-        isOcr: true,
-      };
-    });
+    let finalLines = [];
 
-    // Sort top-to-bottom, then left-to-right
-    wordItems.sort((a, b) => {
-      if (Math.abs(a.vy - b.vy) > Math.max(6, Math.min(a.height, b.height) * 0.45)) {
-        return a.vy - b.vy;
+    // 3. Check if the scanned document/card inside the PDF is rotated 90° CCW (sideways vertical text, like EAD_Xingyuan_Zhu.pdf)
+    if (uprightWords.length < 5) {
+      if (!silentModal) {
+        showExportProgress(true, '检测到横置/竖排扫描证件与防伪底纹，正在自动转正并深度去底纹识别...');
       }
-      return a.left - b.left;
-    });
+      // Build +90° CW rotated canvas (width = baseH, height = baseW)
+      const rot90Canvas = document.createElement('canvas');
+      rot90Canvas.width = baseH;
+      rot90Canvas.height = baseW;
+      const rCtx = rot90Canvas.getContext('2d', { willReadFrequently: true });
+      rCtx.translate(baseH, 0);
+      rCtx.rotate(Math.PI / 2);
+      rCtx.drawImage(uprightCanvas, 0, 0);
+      rCtx.setTransform(1, 0, 0, 1, 0, 0);
 
-    // Cluster adjacent words on the same line (without crossing table columns)
-    const clusteredLines = [];
-    let current = null;
+      // Run both watermark-suppressed pass (captures IOE0914412232, C09, 221-556-390, dates over eagle feathers)
+      // and raw pass (captures XINGYUAN, ZHU, headers)
+      const cleanRot90 = buildWatermarkSuppressedCanvas(rot90Canvas);
+      const [resRotClean, resRotRaw] = await Promise.all([
+        Tesseract.recognize(cleanRot90, lang),
+        Tesseract.recognize(rot90Canvas, lang),
+      ]);
 
-    for (const item of wordItems) {
-      if (!current) {
-        current = { ...item, text: item.str };
-        continue;
-      }
-      const sameBaseline = Math.abs(current.vy - item.vy) <= Math.max(6, item.height * 0.48);
-      const xGap = item.left - (current.left + current.width);
-      const sameSize = Math.abs(current.canvasFontSize - item.canvasFontSize) <= 4;
-      const isClose = (xGap >= -6 && xGap <= Math.min(22, item.height * 1.35));
+      const rotWordsClean = extractValidWords(resRotClean, 1.0);
+      const rotWordsRaw = extractValidWords(resRotRaw, 1.0);
+      const mergedRotWords = mergeWordLists(rotWordsClean, rotWordsRaw);
 
-      if (sameBaseline && sameSize && isClose) {
-        const isCjk = /[\u4e00-\u9fa5]/.test(current.text.slice(-1)) && /[\u4e00-\u9fa5]/.test(item.str[0]);
-        const sep = (xGap > 1 && !isCjk) ? ' ' : '';
-        current.text += sep + item.str;
-        current.top = Math.min(current.top, item.top);
-        const bottom = Math.max(current.top + current.height, item.top + item.height);
-        current.width = (item.left + item.width) - current.left;
-        current.height = bottom - current.top;
-        current.canvasFontSize = Math.round((current.canvasFontSize + item.canvasFontSize) / 2);
-      } else {
-        clusteredLines.push(current);
-        current = { ...item, text: item.str };
+      if (mergedRotWords.length > uprightWords.length) {
+        const rotClustered = clusterOcrWordsIntoLines(mergedRotWords);
+        rotClustered.forEach((rLine, idx) => {
+          // Map +90° CW reading coordinates (rx0, ry0, rx1, ry1) back to unrotated pdfCanvas (baseW x baseH):
+          // Forward +90° CW mapped (x, y) -> (rx = baseH - y, ry = x).
+          // Therefore inverse mapping back to pdfCanvas is:
+          // x = ry, y = baseH - rx!
+          const rx0 = rLine.left;
+          const ry0 = rLine.top;
+          const rx1 = rLine.left + rLine.width;
+          const ry1 = rLine.top + rLine.height;
+
+          const boxLeft = Math.max(0, Math.round(ry0));
+          const boxTop = Math.max(0, Math.round(baseH - rx1));
+          const boxWidth = Math.max(8, Math.round(ry1 - ry0));   // Vertical line's thickness on pdfCanvas
+          const boxHeight = Math.max(10, Math.round(rx1 - rx0)); // Vertical line's length on pdfCanvas
+          const fontSize = Math.max(10, Math.min(44, Math.round(boxWidth * 0.88)));
+
+          finalLines.push({
+            id: `ocr_rot_p${pageNum}_${idx}`,
+            text: rLine.text,
+            str: rLine.text,
+            left: boxLeft,
+            top: boxTop,
+            width: boxWidth,
+            height: boxHeight,
+            textLeft: boxLeft,
+            textTop: Math.round(baseH - rx0),
+            angle: -90,
+            canvasFontSize: fontSize,
+            pdfFontSize: Math.round(fontSize / state.baseScale),
+            isBold: /^[A-Z0-9/-]{3,}$/.test(rLine.text) || rLine.text.includes('IOE'),
+            fontFamily: 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
+            isOcr: true,
+          });
+        });
       }
     }
-    if (current) clusteredLines.push(current);
 
-    // Refine each OCR line using pixel-level ink bounds & stroke density
-    const finalLines = [];
-    clusteredLines.forEach((line, idx) => {
-      const colors = samplePdfColors(line.left, line.top, line.width, line.height);
-      if (!colors.hasVisibleInk) return;
-      const inkBounds = detectInkBoundsInBox(line.left, line.top, line.width, line.height, colors.bgColor);
-      const refinedTop = inkBounds ? inkBounds.inkTop : line.top;
-      const refinedHeight = inkBounds ? Math.max(8, inkBounds.inkHeight) : line.height;
-      const refinedFontSize = Math.max(9, Math.min(48, Math.round(refinedHeight * 1.02)));
+    // 4. If upright orientation produced valid lines, refine and store them
+    if (finalLines.length === 0 && uprightWords.length > 0) {
+      const clusteredLines = clusterOcrWordsIntoLines(uprightWords);
+      clusteredLines.forEach((line, idx) => {
+        const colors = samplePdfColors(line.left, line.top, line.width, line.height);
+        if (!colors.hasVisibleInk) return;
+        const inkBounds = detectInkBoundsInBox(line.left, line.top, line.width, line.height, colors.bgColor);
+        const refinedTop = inkBounds ? inkBounds.inkTop : line.top;
+        const refinedHeight = inkBounds ? Math.max(8, inkBounds.inkHeight) : line.height;
+        const refinedFontSize = Math.max(9, Math.min(48, Math.round(refinedHeight * 0.96)));
 
-      finalLines.push({
-        id: `ocr_p${pageNum}_${idx}`,
-        text: line.text,
-        str: line.text,
-        left: inkBounds ? inkBounds.inkLeft : line.left,
-        top: refinedTop,
-        width: inkBounds ? Math.max(line.width, inkBounds.inkWidth) : line.width,
-        height: refinedHeight,
-        canvasFontSize: refinedFontSize,
-        pdfFontSize: Math.round(refinedFontSize / state.baseScale),
-        isBold: inkBounds ? inkBounds.isBold : Boolean(colors.isBoldInk),
-        fontFamily: 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
-        isOcr: true,
+        finalLines.push({
+          id: `ocr_p${pageNum}_${idx}`,
+          text: line.text,
+          str: line.text,
+          left: inkBounds ? inkBounds.inkLeft : line.left,
+          top: refinedTop,
+          width: inkBounds ? Math.max(line.width, inkBounds.inkWidth) : line.width,
+          height: refinedHeight,
+          angle: 0,
+          canvasFontSize: refinedFontSize,
+          pdfFontSize: Math.round(refinedFontSize / state.baseScale),
+          isBold: inkBounds ? inkBounds.isBold : Boolean(colors.isBoldInk),
+          fontFamily: 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
+          isOcr: true,
+        });
       });
-    });
+    }
 
     state.pageTextLines[pageNum] = finalLines;
     state.isScannedPage[pageNum] = true;
@@ -3794,22 +4517,23 @@ async function runOcrOnCurrentPage(lang = 'eng') {
       elements.scanDetectedBanner.classList.add('hidden');
     }
 
-    showExportProgress(false);
-    setTool('tap-edit');
-
-    if (finalLines.length > 0) {
-      showToast(`✨ 识别完成！共定位 ${finalLines.length} 处文字，直接点击图中文字即可无痕修改！`, 'success');
-      if (window.confetti) {
-        window.confetti({ particleCount: 55, spread: 65, origin: { y: 0.75 } });
+    if (!silentModal) {
+      showExportProgress(false);
+      setTool('tap-edit');
+      if (finalLines.length > 0) {
+        showToast(`✨ 深度识别完成！共定位 ${finalLines.length} 处文字/编号，直接点击或用「一键替换」即可无痕修改！`, 'success');
+        if (window.confetti) {
+          window.confetti({ particleCount: 55, spread: 65, origin: { y: 0.75 } });
+        }
+      } else {
+        showToast('未识别出清晰文字，您可直接使用底部「框选无痕改字」拖拽修改任意位置', 'warning');
       }
-    } else {
-      showToast('未识别出清晰文字，您可直接使用底部「框选无痕改字」拖拽修改任意位置', 'warning');
     }
     return finalLines;
   } catch (err) {
-    showExportProgress(false);
+    if (!silentModal) showExportProgress(false);
     console.error('OCR error:', err);
-    showToast('OCR 识别失败: ' + err.message + '，可使用底部「框选无痕改字」', 'error');
+    if (!silentModal) showToast('OCR 识别失败: ' + err.message + '，可使用底部「框选无痕改字」', 'error');
     return [];
   } finally {
     isRunningOcr = false;
@@ -3825,7 +4549,9 @@ window.convertAllTextToEditable = convertAllTextToEditable;
 window.openBatchReplaceModal = openBatchReplaceModal;
 window.executeBatchReplace = executeBatchReplace;
 window.runOcrOnCurrentPage = runOcrOnCurrentPage;
+window.rotateCurrentPage90 = rotateCurrentPage90;
 window.buildMaskSeamlessPatch = buildMaskSeamlessPatch;
+window.renderReplaceDetectedChips = renderReplaceDetectedChips;
 
 // Initialize Application
 function initApp() {

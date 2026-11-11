@@ -84,6 +84,12 @@
         <span class="hidden sm:inline">打开</span>
       </button>
 
+      <!-- Rotate Page 90° CW Button -->
+      <button id="btn-rotate-page" class="hidden px-2.5 sm:px-3 py-1.5 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 active:bg-slate-300 border border-slate-300 rounded-lg flex items-center space-x-1 shadow-sm transition" title="顺时针旋转当前页 90°（适合横向/倒置的扫描件转正）">
+        <i class="fa-solid fa-rotate-right text-indigo-600"></i>
+        <span class="hidden sm:inline">旋转</span>
+      </button>
+
       <!-- OCR Scanned Image Recognition Button -->
       <button id="btn-ocr-page" class="hidden px-2.5 sm:px-3 py-1.5 text-xs font-semibold text-amber-700 bg-amber-50 hover:bg-amber-100 active:bg-amber-200 border border-amber-300 rounded-lg flex items-center space-x-1.5 shadow-sm transition" title="OCR 扫描件智能识字：识别纯图片/扫描件中的文字，支持直接点击无痕改字与一键替换">
         <i class="fa-solid fa-eye text-amber-600"></i>
@@ -118,11 +124,15 @@
         <span class="hidden sm:inline">转回原样</span>
       </button>
 
-      <!-- Mode Switcher Pill (Browse 🖐️ vs Edit ✏️) -->
+      <!-- Mode Switcher Pill (Browse 🖐️ vs Select 🖱️ vs Edit ✏️) -->
       <div id="mode-switch-group" class="hidden items-center bg-slate-200 p-0.5 rounded-lg border border-slate-300">
         <button id="btn-mode-browse" class="px-2 sm:px-2.5 py-1 text-xs font-semibold rounded-md flex items-center space-x-1 transition text-slate-600 hover:text-slate-900" title="浏览/缩放模式：手指拖动平移，双指缩放">
           <i class="fa-solid fa-hand text-xs"></i>
           <span class="hidden md:inline">浏览</span>
+        </button>
+        <button id="btn-mode-select" class="px-2 sm:px-2.5 py-1 text-xs font-semibold rounded-md flex items-center space-x-1 transition text-slate-600 hover:text-slate-900" title="选中模式：点击或框选任意文字/元素进行选中、移动、缩放或删除">
+          <i class="fa-solid fa-arrow-pointer text-xs"></i>
+          <span class="hidden md:inline">选中</span>
         </button>
         <button id="btn-mode-edit" class="px-2 sm:px-2.5 py-1 text-xs font-semibold rounded-md flex items-center space-x-1 transition bg-white text-blue-600 shadow-sm" title="编辑模式：点击或框选进行修改">
           <i class="fa-solid fa-pen-to-square text-xs"></i>
@@ -172,9 +182,13 @@
       <span id="scan-banner-text" class="truncate">检测到本页为纯扫描图片！已自动开启「纸张纹理无痕修复」，可一键 OCR 识字或直接用「框选改字」：</span>
     </div>
     <div class="flex items-center space-x-1.5 shrink-0">
-      <button id="btn-ocr-fast-eng" class="px-2.5 py-1 bg-white text-amber-800 font-bold rounded shadow-sm hover:bg-amber-50 active:scale-95 transition text-[11px] flex items-center space-x-1" title="极速识别英文、数字、账单、日期与金额">
+      <button id="btn-scan-rotate" class="px-2.5 py-1 bg-indigo-900/80 hover:bg-indigo-900 text-white font-semibold rounded shadow-sm active:scale-95 transition text-[11px] flex items-center space-x-1" title="如果扫描件方向是横着的，点击顺时针旋转 90° 转正">
+        <i class="fa-solid fa-rotate-right"></i>
+        <span>旋转转正</span>
+      </button>
+      <button id="btn-ocr-fast-eng" class="px-2.5 py-1 bg-white text-amber-800 font-bold rounded shadow-sm hover:bg-amber-50 active:scale-95 transition text-[11px] flex items-center space-x-1" title="极速识别英文、数字、账单、日期与证件号（支持自动识别竖排90°文字）">
         <i class="fa-solid fa-bolt text-amber-600"></i>
-        <span>识别英文/数字账单</span>
+        <span>识别英文/数字/证件</span>
       </button>
       <button id="btn-ocr-chi-eng" class="px-2.5 py-1 bg-amber-900/70 hover:bg-amber-900 text-white font-semibold rounded shadow-sm active:scale-95 transition text-[11px] flex items-center space-x-1" title="识别中文+英文混合扫描文档">
         <i class="fa-solid fa-language"></i>
@@ -341,15 +355,23 @@
     <div class="flex items-center justify-around max-w-xl mx-auto overflow-x-auto space-x-1 no-scrollbar py-0.5">
       
       <!-- Tool 1: Tap to Edit (Word-like, Default Active) -->
-      <button id="tool-tap-edit" class="toolbar-btn flex flex-col items-center justify-center min-w-[56px] py-1 px-1.5 rounded-xl transition active-tool text-blue-600" data-tool="tap-edit" title="点字即改：点击 PDF 上的任意文字直接编辑">
+      <button id="tool-tap-edit" class="toolbar-btn flex flex-col items-center justify-center min-w-[54px] py-1 px-1.5 rounded-xl transition active-tool text-blue-600" data-tool="tap-edit" title="点字即改：点击 PDF 上的任意文字直接编辑">
         <div class="w-8 h-8 rounded-full flex items-center justify-center text-sm mb-0.5 tool-icon-bg bg-blue-100 text-blue-600">
           <i class="fa-solid fa-i-cursor"></i>
         </div>
         <span class="text-[10px] font-semibold leading-none">点字即改</span>
       </button>
 
-      <!-- Tool 2: Cover & Edit (Drag rubberband box) -->
-      <button id="tool-cover-edit" class="toolbar-btn flex flex-col items-center justify-center min-w-[56px] py-1 px-1.5 rounded-xl transition text-slate-600 hover:text-blue-600" data-tool="cover-edit" title="框选改字：拖拽框选任意区域覆盖改字">
+      <!-- Tool 2: Select & Move (选中/框选) -->
+      <button id="tool-select" class="toolbar-btn flex flex-col items-center justify-center min-w-[54px] py-1 px-1.5 rounded-xl transition text-slate-600 hover:text-blue-600" data-tool="select" title="选中工具：点击或拉框选中文字/元素，可自由移动、缩放、调字号或一键替换">
+        <div class="w-8 h-8 rounded-full flex items-center justify-center text-sm mb-0.5 tool-icon-bg">
+          <i class="fa-solid fa-arrow-pointer"></i>
+        </div>
+        <span class="text-[10px] font-medium leading-none">选中移动</span>
+      </button>
+
+      <!-- Tool 3: Cover & Edit (Drag rubberband box) -->
+      <button id="tool-cover-edit" class="toolbar-btn flex flex-col items-center justify-center min-w-[54px] py-1 px-1.5 rounded-xl transition text-slate-600 hover:text-blue-600" data-tool="cover-edit" title="框选改字：拖拽框选任意区域覆盖改字">
         <div class="w-8 h-8 rounded-full flex items-center justify-center text-sm mb-0.5 tool-icon-bg">
           <i class="fa-solid fa-eraser"></i>
         </div>
@@ -682,11 +704,28 @@
           </div>
         </div>
 
+        <!-- Detected Page Tokens Quick-Pick Chips (Especially helpful for scanned PDFs!) -->
+        <div id="replace-detected-chips-container" class="bg-amber-50/70 border border-amber-200/80 rounded-xl p-2.5 space-y-1.5">
+          <div class="flex items-center justify-between">
+            <span id="replace-chips-title" class="text-[11px] font-semibold text-amber-900 flex items-center gap-1">
+              <i class="fa-solid fa-wand-magic-sparkles text-amber-600"></i>
+              <span>本页已识别编号/文字 (点击直接填入)：</span>
+            </span>
+            <button id="btn-rescan-in-replace" type="button" class="px-2 py-0.5 bg-amber-600 hover:bg-amber-700 text-white rounded text-[10px] font-semibold transition flex items-center gap-1 shadow-sm" title="对当前扫描 PDF 页面重新运行深度去底纹 OCR 识别">
+              <i class="fa-solid fa-eye"></i>
+              <span>深度OCR识字</span>
+            </button>
+          </div>
+          <div id="replace-detected-chips" class="flex flex-wrap gap-1 max-h-20 overflow-y-auto pt-0.5">
+            <span class="text-[11px] text-slate-400">正在读取页面文字...</span>
+          </div>
+        </div>
+
         <!-- Real-time matches preview list -->
         <div id="replace-preview-container" class="hidden">
           <p class="text-xs font-semibold text-slate-500 mb-1 flex items-center justify-between">
             <span>匹配预览 (前 5 条)：</span>
-            <span id="replace-preview-hint" class="text-[10px] text-slate-400">将自动转换为 Word 文本框并保留字重格式</span>
+            <span id="replace-preview-hint" class="text-[10px] text-slate-400">将自动转换为无痕文本框并保留原方向与字重</span>
           </p>
           <div id="replace-preview-list" class="max-h-24 overflow-y-auto space-y-1 text-xs text-slate-600 bg-slate-50 rounded-lg p-2 border border-slate-200 font-mono">
           </div>
@@ -714,6 +753,6 @@
   </div>
 
   <!-- Application Logic -->
-  <script src="app.js?v=20261110v4"></script>
+  <script src="app.js?v=20261110v5"></script>
 </body>
 </html>
