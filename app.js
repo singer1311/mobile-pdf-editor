@@ -1766,25 +1766,58 @@ function detectInkBoundsInBox(left, top, width, height, bgHex, sourceCanvas = nu
       }
     }
 
-    // Require >= 2 ink pixels in row/col so isolated scanner dust speckles don't stretch ink bounds
-    let minX = w, maxX = -1, minY = h, maxY = -1;
-    for (let x = 0; x < w; x++) {
-      if (colCounts[x] >= 2) {
-        if (x < minX) minX = x;
-        if (x > maxX) maxX = x;
+    // Select the main contiguous vertical ink band by ink-pixel mass (allowing <= 2px gaps for broken/italic strokes)
+    // so stray corner/border pixels separated by blank background rows don't inflate inkHeight!
+    const minRowPixels = Math.max(2, Math.floor(w * 0.015));
+    let minY = h, maxY = -1;
+    let bestMass = 0, runStart = -1, runEnd = -1, runMass = 0, emptyGap = 0;
+    for (let y = 0; y < h; y++) {
+      if (rowCounts[y] >= minRowPixels) {
+        if (runStart === -1) runStart = y;
+        runEnd = y;
+        runMass += rowCounts[y];
+        emptyGap = 0;
+      } else if (runStart !== -1) {
+        emptyGap++;
+        if (emptyGap > 3) {
+          if (runMass > bestMass) {
+            bestMass = runMass; minY = runStart; maxY = runEnd;
+          }
+          runStart = -1; runEnd = -1; runMass = 0; emptyGap = 0;
+        }
       }
     }
-    for (let y = 0; y < h; y++) {
-      if (rowCounts[y] >= 2) {
-        if (y < minY) minY = y;
-        if (y > maxY) maxY = y;
+    if (runStart !== -1 && runMass > bestMass) {
+      bestMass = runMass; minY = runStart; maxY = runEnd;
+    }
+
+    // Recompute horizontal extent strictly inside the dominant vertical text band [minY..maxY]
+    let minX = w, maxX = -1;
+    if (maxY >= minY) {
+      const bandColCounts = new Int32Array(w);
+      for (let y = minY; y <= maxY; y++) {
+        for (let x = 0; x < w; x++) {
+          const i = (y * w + x) * 4;
+          if (data[i + 3] < 80) continue;
+          const cbg = colBg[x];
+          const cbgLum = cbg.r * 0.299 + cbg.g * 0.587 + cbg.b * 0.114;
+          const pixLum = data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+          const isInkPix = isLightBg ? (cbgLum - pixLum) > 22 : (pixLum - cbgLum) > 26;
+          if (isInkPix) bandColCounts[x]++;
+        }
+      }
+      for (let x = 0; x < w; x++) {
+        if (bandColCounts[x] >= 2) {
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+        }
       }
     }
 
-    if (maxX < minX || maxY < minY || inkPixels < 3) return null;
+    if (maxX < minX || maxY < minY || bestMass < 3) return null;
     const inkW = Math.max(4, maxX - minX + 1);
     const inkH = Math.max(4, maxY - minY + 1);
-    const inkDensity = inkPixels / Math.max(1, inkW * inkH);
+    const inkDensity = bestMass / Math.max(1, inkW * inkH);
 
     return {
       inkLeft: l + minX,
