@@ -4196,7 +4196,7 @@ function normalizeOcrToken(raw) {
   return s;
 }
 
-function isUsefulOcrToken(cleanStr, conf, bw, bh) {
+function isUsefulOcrToken(cleanStr, conf, bw, bh, isFilteredPass = false) {
   if (!cleanStr || cleanStr.length === 0) return false;
   if (bw < 5 || bh < 6 || bh > 140) return false;
   // Filter pure punctuation noise
@@ -4208,11 +4208,16 @@ function isUsefulOcrToken(cleanStr, conf, bw, bh) {
     /^C09$/i.test(cleanStr) ||
     /^\d{2}\/\d{2}\/\d{2,4}$/.test(cleanStr) ||
     /^\d{4}$/.test(cleanStr) ||
-    /^\$?\d+[.,]\d{2}$/.test(cleanStr)
+    /^\d{2}$/.test(cleanStr) ||
+    /^\$?\d+[.,]\d{2}$/.test(cleanStr) ||
+    /^(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)$/i.test(cleanStr)
   );
   if (isIdOrNum) return true;
-  if (conf >= 55 && cleanStr.length >= 2) return true;
-  if (conf >= 30 && /^[A-Za-z0-9\u4e00-\u9fa5/-]{3,}$/.test(cleanStr)) return true;
+  if (isFilteredPass) {
+    return conf >= 65 && /^[A-Za-z\u4e00-\u9fa5]{4,}$/.test(cleanStr);
+  }
+  if (conf >= 70 && cleanStr.length >= 2) return true;
+  if (conf >= 52 && /^[A-Za-z0-9\u4e00-\u9fa5/-]{3,}$/.test(cleanStr)) return true;
   return false;
 }
 
@@ -4353,14 +4358,14 @@ async function runOcrOnCurrentPage(lang = 'eng', forceRescan = false, silentModa
     const uCtx = uprightCanvas.getContext('2d', { willReadFrequently: true });
     uCtx.drawImage(elements.pdfCanvas, 0, 0);
 
-    const extractValidWords = (tessResult, scaleRatio = 1.0) => {
+    const extractValidWords = (tessResult, scaleRatio = 1.0, isFilteredPass = false) => {
       const out = [];
       for (const w of (tessResult?.data?.words || [])) {
         const cleanStr = normalizeOcrToken(w.text);
         const bw = (w.bbox.x1 - w.bbox.x0) * scaleRatio;
         const bh = (w.bbox.y1 - w.bbox.y0) * scaleRatio;
         const conf = w.confidence !== undefined ? w.confidence : 50;
-        if (!isUsefulOcrToken(cleanStr, conf, bw, bh)) continue;
+        if (!isUsefulOcrToken(cleanStr, conf, bw, bh, isFilteredPass)) continue;
         const left = w.bbox.x0 * scaleRatio;
         const top = w.bbox.y0 * scaleRatio;
         const canvasFontSize = Math.max(9, Math.min(48, Math.round(bh * 0.88)));
@@ -4404,14 +4409,7 @@ async function runOcrOnCurrentPage(lang = 'eng', forceRescan = false, silentModa
         }
       },
     });
-    let uprightWords = extractValidWords(res0, 1.0);
-
-    // If upright has few words, also try watermark-suppressed upright
-    if (uprightWords.length > 0 && uprightWords.length < 8) {
-      const clean0 = buildWatermarkSuppressedCanvas(uprightCanvas);
-      const res0Clean = await Tesseract.recognize(clean0, lang);
-      uprightWords = mergeWordLists(extractValidWords(res0Clean, 1.0), uprightWords);
-    }
+    let uprightWords = extractValidWords(res0, 1.0, false);
 
     let finalLines = [];
 
@@ -4438,8 +4436,8 @@ async function runOcrOnCurrentPage(lang = 'eng', forceRescan = false, silentModa
         Tesseract.recognize(rot90Canvas, lang),
       ]);
 
-      const rotWordsClean = extractValidWords(resRotClean, 1.0);
-      const rotWordsRaw = extractValidWords(resRotRaw, 1.0);
+      const rotWordsClean = extractValidWords(resRotClean, 1.0, true);
+      const rotWordsRaw = extractValidWords(resRotRaw, 1.0, false);
       const mergedRotWords = mergeWordLists(rotWordsClean, rotWordsRaw);
 
       if (mergedRotWords.length > uprightWords.length) {
@@ -4479,6 +4477,13 @@ async function runOcrOnCurrentPage(lang = 'eng', forceRescan = false, silentModa
           });
         });
       }
+    }
+
+    // If upright still has few words and wasn't rotated, also try watermark-suppressed upright
+    if (finalLines.length === 0 && uprightWords.length < 8) {
+      const clean0 = buildWatermarkSuppressedCanvas(uprightCanvas);
+      const res0Clean = await Tesseract.recognize(clean0, lang);
+      uprightWords = mergeWordLists(extractValidWords(res0Clean, 1.0, true), uprightWords);
     }
 
     // 4. If upright orientation produced valid lines, refine and store them
