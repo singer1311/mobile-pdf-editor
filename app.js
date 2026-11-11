@@ -1714,7 +1714,7 @@ function detectInkBoundsInBox(left, top, width, height, bgHex, sourceCanvas = nu
     const fallbackBg = parseHexRgb(bgHex || '#ffffff');
     const data = ctx.getImageData(l, t, w, h).data;
 
-    // Sample top 2 rows & bottom 2 rows per column to resist diagonal illumination / shadow blotches
+    // Sample top 2 rows & bottom 2 rows per column only when they belong to the same interior container tone (fallbackBg)
     const colBg = new Array(w);
     for (let x = 0; x < w; x++) {
       let sr = 0, sg = 0, sb = 0, cnt = 0;
@@ -1722,7 +1722,10 @@ function detectInkBoundsInBox(left, top, width, height, bgHex, sourceCanvas = nu
       for (const ry of [0, 1, Math.max(0, h - 2), h - 1]) {
         const i = (ry * w + x) * 4;
         if (data[i + 3] < 80) continue;
-        samples.push({ r: data[i], g: data[i + 1], b: data[i + 2], lum: data[i] + data[i + 1] + data[i + 2] });
+        const distToInterior = Math.abs(data[i] - fallbackBg.r) + Math.abs(data[i + 1] - fallbackBg.g) + Math.abs(data[i + 2] - fallbackBg.b);
+        if (distToInterior <= 58) {
+          samples.push({ r: data[i], g: data[i + 1], b: data[i + 2], lum: data[i] + data[i + 1] + data[i + 2] });
+        }
       }
       if (samples.length > 0) {
         samples.sort((a, b) => b.lum - a.lum);
@@ -4493,9 +4496,9 @@ function buildScannerContrastCanvas(sourceCanvas) {
       const diff = localMean - valLum;
       const p = y * w + x;
 
-      // Require >= 20 contrast diff (ignores faint ledger grid lines & paper grain) and real ink darkness (prevents pastel/shaded header borders turning black)
-      if (diff > 20 && valLum < 158) {
-        const val = Math.max(0, Math.min(255, Math.round(255 - (diff - 12) * 6.5)));
+      // Require >= 24 contrast diff and true ink darkness (< 134) so shaded header borders don't turn into black boxes
+      if (diff > 24 && valLum < 134) {
+        const val = Math.max(0, Math.min(255, Math.round(255 - (diff - 14) * 6.8)));
         outGray[p] = val;
         if (val < 165) inkMap[p] = 1;
       } else {
@@ -4567,7 +4570,7 @@ function clusterOcrWordsIntoLines(wordItems) {
 
     if (sameBaseline && sameSize && isClose) {
       const isCjk = /[\u4e00-\u9fa5]/.test(current.text.slice(-1)) && /[\u4e00-\u9fa5]/.test(item.str[0]);
-      const sep = (xGap > 1 && !isCjk) ? ' ' : '';
+      const sep = (xGap > Math.max(1.8, item.height * 0.16) && !isCjk) ? ' ' : '';
       current.text += sep + item.str;
       current.top = Math.min(current.top, item.top);
       const bottom = Math.max(current.top + current.height, item.top + item.height);
