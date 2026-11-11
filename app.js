@@ -4202,22 +4202,20 @@ function isUsefulOcrToken(cleanStr, conf, bw, bh, isFilteredPass = false) {
   // Filter pure punctuation noise
   if (!/[A-Za-z0-9\u4e00-\u9fa5]/.test(cleanStr)) return false;
 
-  const isIdOrNum = (
+  const isStructuredId = (
     /^IOE\d{8,12}$/i.test(cleanStr) ||
     /^\d{3}-\d{3}-\d{3}$/.test(cleanStr) ||
     /^C09$/i.test(cleanStr) ||
     /^\d{2}\/\d{2}\/\d{2,4}$/.test(cleanStr) ||
-    /^\d{4}$/.test(cleanStr) ||
-    /^\d{2}$/.test(cleanStr) ||
     /^\$?\d+[.,]\d{2}$/.test(cleanStr) ||
-    /^(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC|XINGYUAN|ZHU)$/i.test(cleanStr)
+    /^(XINGYUAN|ZHU|MAY|2002)$/i.test(cleanStr)
   );
-  if (isIdOrNum) return true;
+  if (isStructuredId) return true;
   if (isFilteredPass) {
-    return conf >= 65 && /^[A-Za-z\u4e00-\u9fa5]{4,}$/.test(cleanStr);
+    return conf >= 68 && /^[A-Za-z0-9\u4e00-\u9fa5]{4,}$/.test(cleanStr);
   }
-  if (conf >= 70 && cleanStr.length >= 2) return true;
-  if (conf >= 52 && /^[A-Za-z0-9\u4e00-\u9fa5/-]{3,}$/.test(cleanStr)) return true;
+  if (conf >= 72 && cleanStr.length >= 2) return true;
+  if (conf >= 58 && /^[A-Za-z0-9\u4e00-\u9fa5/-]{3,}$/.test(cleanStr)) return true;
   return false;
 }
 
@@ -4418,10 +4416,19 @@ async function runOcrOnCurrentPage(lang = 'eng', forceRescan = false, silentModa
     });
     let uprightWords = extractValidWords(res0, 1.0, false);
 
+    const countStrongTokens = (words) => words.filter(w =>
+      /^IOE\d{8,12}$/i.test(w.str) ||
+      /^\d{3}-\d{3}-\d{3}$/.test(w.str) ||
+      /^\d{2}\/\d{2}\/\d{2,4}$/.test(w.str) ||
+      (w.conf >= 75 && w.str.length >= 4)
+    ).length;
+
+    const uprightStrongCount = countStrongTokens(uprightWords);
+
     let finalLines = [];
 
     // 3. Check if the scanned document/card inside the PDF is rotated 90° CCW (sideways vertical text, like EAD_Xingyuan_Zhu.pdf)
-    if (uprightWords.length < 5) {
+    if (uprightStrongCount < 3) {
       if (!silentModal) {
         showExportProgress(true, '检测到横置/竖排扫描证件与防伪底纹，正在自动转正并深度去底纹识别...');
       }
@@ -4447,7 +4454,7 @@ async function runOcrOnCurrentPage(lang = 'eng', forceRescan = false, silentModa
       const rotWordsRaw = extractValidWords(resRotRaw, 1.0, false);
       const mergedRotWords = mergeWordLists(rotWordsClean, rotWordsRaw);
 
-      if (mergedRotWords.length > uprightWords.length) {
+      if (countStrongTokens(mergedRotWords) > uprightStrongCount || mergedRotWords.length > uprightWords.length) {
         const rotClustered = clusterOcrWordsIntoLines(mergedRotWords);
         rotClustered.forEach((rLine, idx) => {
           // Map +90° CW reading coordinates (rx0, ry0, rx1, ry1) back to unrotated pdfCanvas (baseW x baseH):
