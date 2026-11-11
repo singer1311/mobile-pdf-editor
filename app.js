@@ -1739,6 +1739,9 @@ function detectInkBoundsInBox(left, top, width, height, bgHex, sourceCanvas = nu
       }
     }
 
+    const fallbackLum = fallbackBg.r * 0.299 + fallbackBg.g * 0.587 + fallbackBg.b * 0.114;
+    const isLightBg = fallbackLum >= 125;
+
     const rowCounts = new Int32Array(h);
     const colCounts = new Int32Array(w);
     let inkPixels = 0;
@@ -1748,8 +1751,14 @@ function detectInkBoundsInBox(left, top, width, height, bgHex, sourceCanvas = nu
         const i = (y * w + x) * 4;
         if (data[i + 3] < 80) continue;
         const cbg = colBg[x];
-        const dist = Math.abs(data[i] - cbg.r) + Math.abs(data[i + 1] - cbg.g) + Math.abs(data[i + 2] - cbg.b);
-        if (dist > 42) {
+        const cbgLum = cbg.r * 0.299 + cbg.g * 0.587 + cbg.b * 0.114;
+        const pixLum = data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114;
+        // Signed contrast: dark ink on shaded/light backgrounds must be DARKER than local column background
+        // (prevents brighter outer paper outside a shaded header box from being counted as "ink")
+        const isInkPix = isLightBg
+          ? (cbgLum - pixLum) > 22
+          : (pixLum - cbgLum) > 26;
+        if (isInkPix) {
           rowCounts[y]++;
           colCounts[x]++;
           inkPixels++;
@@ -4498,8 +4507,8 @@ function buildScannerContrastCanvas(sourceCanvas) {
       const diff = localMean - valLum;
       const p = y * w + x;
 
-      // Require >= 20 contrast diff and dark stroke luminance (< 148) to capture faded strokes while ignoring pastel header borders
-      if (diff > 20 && valLum < 148) {
+      // Require >= 20 contrast diff and dark stroke luminance (< 156) to capture faded strokes while ignoring bright grid paper
+      if (diff > 20 && valLum < 156) {
         const val = Math.max(0, Math.min(255, Math.round(255 - (diff - 12) * 6.8)));
         outGray[p] = val;
         if (val < 165) inkMap[p] = 1;
@@ -4632,7 +4641,7 @@ async function runOcrOnCurrentPage(lang = 'eng', forceRescan = false, silentModa
       for (const w of (tessResult?.data?.words || [])) {
         const cleanStr = cleanOcrToken(w.text);
         if (!cleanStr) continue;
-        if (!/[A-Za-z0-9\u4e00-\u9fa5$#¥€£%+-]/.test(cleanStr)) continue;
+        if (!/[A-Za-z0-9\u4e00-\u9fa5]/.test(cleanStr)) continue;
         const conf = w.confidence !== undefined ? w.confidence : 50;
         if (conf < minConf) continue;
         const bw = (w.bbox.x1 - w.bbox.x0) * ratio;
