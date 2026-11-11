@@ -967,6 +967,39 @@ async function renderPage(pageNum, skipSaveCurrent = false) {
 }
 
 let isRestoringHistory = false;
+let historyBatchPreSnapshot = null;
+
+function beginHistoryBatch(pageNum) {
+  const p = pageNum || state.currentPage;
+  const emptyStr = JSON.stringify({ version: '5.3.0', objects: [] });
+  historyBatchPreSnapshot = state.pageStates[p] ? JSON.stringify(state.pageStates[p]) : emptyStr;
+  isRestoringHistory = true;
+}
+
+function endHistoryBatch(pageNum) {
+  const p = pageNum || state.currentPage;
+  isRestoringHistory = false;
+  if (!fabricCanvas) {
+    historyBatchPreSnapshot = null;
+    return;
+  }
+  sanitizeFabricCanvasObjects(fabricCanvas);
+  const json = fabricCanvas.toJSON(SERIALIZE_PROPS);
+  delete json.viewportTransform;
+  const normalized = normalizePageStateJson(json);
+  const nextStr = JSON.stringify(normalized);
+  if (historyBatchPreSnapshot && nextStr !== historyBatchPreSnapshot) {
+    if (!Array.isArray(state.historyStack[p])) state.historyStack[p] = [];
+    if (state.historyStack[p][state.historyStack[p].length - 1] !== historyBatchPreSnapshot) {
+      state.historyStack[p].push(historyBatchPreSnapshot);
+      if (state.historyStack[p].length > 25) state.historyStack[p].shift();
+    }
+  }
+  historyBatchPreSnapshot = null;
+  state.pageStates[p] = normalized;
+  saveDraftToStorage();
+}
+
 function saveCurrentPageState(pageNum) {
   if (!fabricCanvas || isTransitioningPage) return;
   const p = pageNum || state.currentPage;
@@ -2059,25 +2092,29 @@ async function convertAllTextToEditable() {
   }
 
   let count = 0;
-  for (const line of lines) {
-    // Skip hidden/invisible PDF metadata text (e.g. white-on-white internal tags with 0 visible ink pixels)
-    const sampled = samplePdfColors(line.left, line.top, line.width, line.height);
-    if (!sampled.hasVisibleInk) continue;
+  beginHistoryBatch(state.currentPage);
+  try {
+    for (const line of lines) {
+      // Skip hidden/invisible PDF metadata text (e.g. white-on-white internal tags with 0 visible ink pixels)
+      const sampled = samplePdfColors(line.left, line.top, line.width, line.height);
+      if (!sampled.hasVisibleInk) continue;
 
-    // Avoid creating duplicates if a textbox already covers this position
-    const alreadyExists = fabricCanvas.getObjects().some(o => 
-      o.data?.isText &&
-      (o.data?.lineId === line.id || 
-       (Math.abs(o.left - line.left) < 6 && Math.abs(o.top - line.top) < 4))
-    );
+      // Avoid creating duplicates if a textbox already covers this position
+      const alreadyExists = fabricCanvas.getObjects().some(o => 
+        o.data?.isText &&
+        (o.data?.lineId === line.id || 
+         (Math.abs(o.left - line.left) < 6 && Math.abs(o.top - line.top) < 4))
+      );
 
-    if (!alreadyExists) {
-      convertLineToTextbox(line, false);
-      count++;
+      if (!alreadyExists) {
+        convertLineToTextbox(line, false);
+        count++;
+      }
     }
+  } finally {
+    endHistoryBatch(state.currentPage);
   }
 
-  saveCurrentPageState(state.currentPage);
   setTool('tap-edit');
   fabricCanvas.requestRenderAll();
 
@@ -3905,51 +3942,55 @@ async function executeBatchReplace() {
   try {
     // 1. Current Page Processing
     if (fabricCanvas) {
-      const activeObjs = fabricCanvas.getObjects();
-      const convertedLineIds = new Set();
+      beginHistoryBatch(state.currentPage);
+      try {
+        const activeObjs = fabricCanvas.getObjects();
+        const convertedLineIds = new Set();
 
-      // Step A: Replace inside active Fabric Textboxes
-      activeObjs.forEach(obj => {
-        if (obj.data?.isText && obj.text) {
-          if (obj.data.lineId) convertedLineIds.add(obj.data.lineId);
-          if (matchTextLine(obj.text, findStr, exact)) {
-            const nextText = replaceTextContent(obj.text, findStr, replaceStr, exact);
-            if (nextText !== obj.text) {
-              obj.set('text', nextText);
-              updateTextDimensionsAndMask(obj);
+        // Step A: Replace inside active Fabric Textboxes
+        activeObjs.forEach(obj => {
+          if (obj.data?.isText && obj.text) {
+            if (obj.data.lineId) convertedLineIds.add(obj.data.lineId);
+            if (matchTextLine(obj.text, findStr, exact)) {
+              const nextText = replaceTextContent(obj.text, findStr, replaceStr, exact);
+              if (nextText !== obj.text) {
+                obj.set('text', nextText);
+                updateTextDimensionsAndMask(obj);
+                totalReplaced++;
+              }
+            }
+          }
+        });
+
+        // Step B: Replace unconverted PDF/OCR text lines on current page
+        let currentLines = state.pageTextLines[state.currentPage];
+        if ((!currentLines || currentLines.length === 0) && !state.isScannedPage[state.currentPage]) {
+          const page = await state.pdfDoc.getPage(state.currentPage);
+          const viewport = page.getViewport({ scale: state.baseScale });
+          currentLines = await extractPageTextLines(page, viewport);
+          state.pageTextLines[state.currentPage] = currentLines;
+        }
+        currentLines = currentLines || [];
+
+        currentLines.forEach(line => {
+          if (convertedLineIds.has(line.id)) return;
+          if (matchTextLine(line.text, findStr, exact)) {
+            const sampled = samplePdfColors(line.left, line.top, line.width, line.height);
+            if (!sampled.hasVisibleInk && !line.isOcr) return;
+            const nextText = replaceTextContent(line.text, findStr, replaceStr, exact);
+            const tb = convertLineToTextbox(line, false);
+            if (tb) {
+              tb.set('text', nextText);
+              updateTextDimensionsAndMask(tb);
               totalReplaced++;
             }
           }
-        }
-      });
-
-      // Step B: Replace unconverted PDF/OCR text lines on current page
-      let currentLines = state.pageTextLines[state.currentPage];
-      if ((!currentLines || currentLines.length === 0) && !state.isScannedPage[state.currentPage]) {
-        const page = await state.pdfDoc.getPage(state.currentPage);
-        const viewport = page.getViewport({ scale: state.baseScale });
-        currentLines = await extractPageTextLines(page, viewport);
-        state.pageTextLines[state.currentPage] = currentLines;
+        });
+      } finally {
+        endHistoryBatch(state.currentPage);
       }
-      currentLines = currentLines || [];
-
-      currentLines.forEach(line => {
-        if (convertedLineIds.has(line.id)) return;
-        if (matchTextLine(line.text, findStr, exact)) {
-          const sampled = samplePdfColors(line.left, line.top, line.width, line.height);
-          if (!sampled.hasVisibleInk && !line.isOcr) return;
-          const nextText = replaceTextContent(line.text, findStr, replaceStr, exact);
-          const tb = convertLineToTextbox(line, false);
-          if (tb) {
-            tb.set('text', nextText);
-            updateTextDimensionsAndMask(tb);
-            totalReplaced++;
-          }
-        }
-      });
 
       fabricCanvas.requestRenderAll();
-      saveCurrentPageState(state.currentPage);
     }
 
     // 2. All Pages Processing (if scope === 'all')
