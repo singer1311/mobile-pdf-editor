@@ -3748,20 +3748,20 @@ async function openBatchReplaceModal(prefillFind = null) {
 
   elements.modalBatchReplace.classList.remove('hidden');
   renderReplaceDetectedChips();
-  updateReplacePreview();
+  await updateReplacePreview();
 
-  // If current page is a scanned PDF (or has <= 2 recognized lines), auto-run deep multi-orientation OCR!
+  // If current page is a scanned image/PDF with <= 2 extracted lines, auto-run general local OCR
   const curLines = state.pageTextLines[state.currentPage] || [];
   if (state.isScannedPage[state.currentPage] && curLines.length <= 2 && !isRunningOcr) {
     if (elements.replaceDetectedChipsContainer) {
       elements.replaceDetectedChipsContainer.classList.remove('hidden');
     }
     if (elements.replaceChipsTitle) {
-      elements.replaceChipsTitle.textContent = '⏳ 检测到该 PDF 内部为扫描图片，正在自动深度识别图中编号与文字...';
+      elements.replaceChipsTitle.textContent = '⏳ 检测到当前页为扫描图像，正在自动运行本地 OCR 识别文字...';
     }
     await runOcrOnCurrentPage('eng', true, true);
     renderReplaceDetectedChips();
-    updateReplacePreview();
+    await updateReplacePreview();
   }
 
   setTimeout(() => {
