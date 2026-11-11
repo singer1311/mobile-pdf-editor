@@ -1714,23 +1714,25 @@ function detectInkBoundsInBox(left, top, width, height, bgHex, sourceCanvas = nu
     const fallbackBg = parseHexRgb(bgHex || '#ffffff');
     const data = ctx.getImageData(l, t, w, h).data;
 
-    // Sample top 2 rows & bottom 2 rows per column only when they belong to the same interior container tone (fallbackBg)
+    // Compute local background per column x using the 75th-percentile pixel within the column itself
+    // (immune to box outer margins like shaded headers, as well as diagonal shadows across columns)
     const colBg = new Array(w);
     for (let x = 0; x < w; x++) {
-      let sr = 0, sg = 0, sb = 0, cnt = 0;
-      const samples = [];
-      for (const ry of [0, 1, Math.max(0, h - 2), h - 1]) {
-        const i = (ry * w + x) * 4;
+      const colPixels = [];
+      for (let y = 0; y < h; y++) {
+        const i = (y * w + x) * 4;
         if (data[i + 3] < 80) continue;
-        const distToInterior = Math.abs(data[i] - fallbackBg.r) + Math.abs(data[i + 1] - fallbackBg.g) + Math.abs(data[i + 2] - fallbackBg.b);
-        if (distToInterior <= 58) {
-          samples.push({ r: data[i], g: data[i + 1], b: data[i + 2], lum: data[i] + data[i + 1] + data[i + 2] });
-        }
+        colPixels.push({ r: data[i], g: data[i + 1], b: data[i + 2], lum: data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114 });
       }
-      if (samples.length > 0) {
-        samples.sort((a, b) => b.lum - a.lum);
-        const keep = samples.slice(0, Math.max(1, Math.ceil(samples.length * 0.75)));
-        keep.forEach(p => { sr += p.r; sg += p.g; sb += p.b; cnt++; });
+      if (colPixels.length >= 4) {
+        colPixels.sort((a, b) => a.lum - b.lum);
+        // Take pixels in [55% .. 80%] brightness band (cleanly above ink, cleanly below outer bright margin if header is darker than paper)
+        const lo = Math.floor(colPixels.length * 0.55);
+        const hi = Math.max(lo + 1, Math.floor(colPixels.length * 0.80));
+        let sr = 0, sg = 0, sb = 0, cnt = 0;
+        for (let k = lo; k < hi; k++) {
+          sr += colPixels[k].r; sg += colPixels[k].g; sb += colPixels[k].b; cnt++;
+        }
         colBg[x] = { r: sr / cnt, g: sg / cnt, b: sb / cnt };
       } else {
         colBg[x] = fallbackBg;
@@ -4496,9 +4498,9 @@ function buildScannerContrastCanvas(sourceCanvas) {
       const diff = localMean - valLum;
       const p = y * w + x;
 
-      // Require >= 24 contrast diff and true ink darkness (< 134) so shaded header borders don't turn into black boxes
-      if (diff > 24 && valLum < 134) {
-        const val = Math.max(0, Math.min(255, Math.round(255 - (diff - 14) * 6.8)));
+      // Require >= 20 contrast diff and dark stroke luminance (< 148) to capture faded strokes while ignoring pastel header borders
+      if (diff > 20 && valLum < 148) {
+        const val = Math.max(0, Math.min(255, Math.round(255 - (diff - 12) * 6.8)));
         outGray[p] = val;
         if (val < 165) inkMap[p] = 1;
       } else {
