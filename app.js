@@ -4210,7 +4210,7 @@ function isUsefulOcrToken(cleanStr, conf, bw, bh, isFilteredPass = false) {
     /^\d{4}$/.test(cleanStr) ||
     /^\d{2}$/.test(cleanStr) ||
     /^\$?\d+[.,]\d{2}$/.test(cleanStr) ||
-    /^(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)$/i.test(cleanStr)
+    /^(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC|XINGYUAN|ZHU)$/i.test(cleanStr)
   );
   if (isIdOrNum) return true;
   if (isFilteredPass) {
@@ -4362,11 +4362,18 @@ async function runOcrOnCurrentPage(lang = 'eng', forceRescan = false, silentModa
       const out = [];
       for (const w of (tessResult?.data?.words || [])) {
         const cleanStr = normalizeOcrToken(w.text);
-        const bw = (w.bbox.x1 - w.bbox.x0) * scaleRatio;
+        let bw = (w.bbox.x1 - w.bbox.x0) * scaleRatio;
         const bh = (w.bbox.y1 - w.bbox.y0) * scaleRatio;
         const conf = w.confidence !== undefined ? w.confidence : 50;
         if (!isUsefulOcrToken(cleanStr, conf, bw, bh, isFilteredPass)) continue;
-        const left = w.bbox.x0 * scaleRatio;
+        let left = w.bbox.x0 * scaleRatio;
+        const right = w.bbox.x1 * scaleRatio;
+        // Clamp excessive left-side bbox stretching caused by stray watermark specks
+        const maxExpectedW = Math.max(bh * 1.4, cleanStr.length * bh * 0.82);
+        if (bw > maxExpectedW) {
+          bw = Math.round(cleanStr.length * bh * 0.62);
+          left = Math.max(0, right - bw);
+        }
         const top = w.bbox.y0 * scaleRatio;
         const canvasFontSize = Math.max(9, Math.min(48, Math.round(bh * 0.88)));
         out.push({
